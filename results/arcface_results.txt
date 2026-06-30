@@ -1,0 +1,11 @@
+model: arcface
+n_people: 20
+n_embeddings: 200
+rank1: 1.0
+cmc: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+tar_at_far_1pct: 0.9877777777777778
+tar_at_far_01pct: 0.9611111111111111
+eer: 0.011105263157894736
+eer_threshold: 0.2578972876073367
+genuine_mean: 0.8364734334581428
+impostor_mean: 0.05287086891590642

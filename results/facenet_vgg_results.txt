@@ -1,0 +1,11 @@
+model: facenet_vgg
+n_people: 20
+n_embeddings: 200
+rank1: 0.98
+cmc: [0.98, 0.995, 0.995, 0.995, 0.995, 0.995, 0.995, 0.995, 0.995, 1.0]
+tar_at_far_1pct: 0.9566666666666667
+tar_at_far_01pct: 0.9422222222222222
+eer: 0.03889473684210526
+eer_threshold: 0.6396228075021037
+genuine_mean: 0.9087809116641681
+impostor_mean: 0.31917114392212154

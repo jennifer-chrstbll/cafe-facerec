@@ -1,0 +1,11 @@
+model: facenet_casia
+n_people: 20
+n_embeddings: 200
+rank1: 0.985
+cmc: [0.985, 0.995, 0.995, 0.995, 0.995, 0.995, 0.995, 0.995, 0.995, 0.995]
+tar_at_far_1pct: 0.9511111111111111
+tar_at_far_01pct: 0.9155555555555556
+eer: 0.03889473684210526
+eer_threshold: 0.7143249511709111
+genuine_mean: 0.9131960879762967
+impostor_mean: 0.4771880539443442

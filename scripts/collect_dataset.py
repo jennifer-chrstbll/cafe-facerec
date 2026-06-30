@@ -2,51 +2,92 @@
 collect_dataset.py
 ------------------
 Captures 10 face photos per person from your webcam.
-Uses RetinaFace detection + Laplacian sharpness filter to keep only good frames.
+
+Pipeline:
+  1. RetinaFace detection (InsightFace buffalo_l/det_10g.onnx)
+     → detects face bounding box + 5 facial landmarks
+  2. norm_crop (affine warp to canonical 112×112 pose)
+     → both eyes at fixed coords, face upright regardless of head tilt
+  3. Laplacian sharpness filter — reject blurry frames
+  4. Save aligned 112×112 crop (same format models were trained on)
 
 Usage:
     python scripts/collect_dataset.py --name "Jennifer"
+    python scripts/collect_dataset.py --name "Jennifer" --photos 20
 """
 
 import cv2
 import os
+import sys
 import argparse
 import time
 import numpy as np
 
+PROJECT_ROOT = r"D:\Projects\cafe_facerec"
+sys.path.insert(0, PROJECT_ROOT)
+
 # ── Config ────────────────────────────────────────────────────────────────────
-DATASET_DIR   = r"D:\Projects\cafe_facerec\dataset"
+DATASET_DIR   = os.path.join(PROJECT_ROOT, "dataset")
 PHOTOS_NEEDED = 10          # photos to save per person
-MIN_SHARPNESS = 60.0        # Laplacian variance threshold for blurry frame rejection
-FACE_MIN_SIZE = 80          # minimum face bounding box dimension in pixels
-CAPTURE_DELAY = 0.4         # seconds between auto-captures (so faces vary slightly)
-WARMUP_FRAMES = 20          # discard first N frames so camera auto-exposure settles
+MIN_SHARPNESS = 45.0        # Laplacian variance threshold (lower OK since alignment normalizes pose)
+FACE_MIN_SIZE = 60          # minimum face bbox width/height in pixels
+CAPTURE_DELAY = 0.5         # seconds between auto-captures (for pose variety)
+WARMUP_FRAMES = 20          # discard first N frames for camera auto-exposure
+DET_THRESH    = 0.5         # RetinaFace detection confidence threshold
+DET_SIZE      = (320, 320)  # RetinaFace input size (lowered from 640 for faster CPU inference)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+COL_GREEN  = (80,  210,  80)
+COL_AMBER  = (30,  190, 255)
+COL_RED    = (60,   60, 220)
+COL_WHITE  = (230, 230, 230)
+COL_CYAN   = (230, 200,   0)
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def laplacian_sharpness(gray_face):
-    """Higher = sharper. Reject blurry frames below MIN_SHARPNESS."""
-    return cv2.Laplacian(gray_face, cv2.CV_64F).var()
+def laplacian_sharpness(gray_img: np.ndarray) -> float:
+    """Return Laplacian variance — higher = sharper. Reject frames below MIN_SHARPNESS."""
+    return cv2.Laplacian(gray_img, cv2.CV_64F).var()
 
 
 def load_face_detector():
-    """Use OpenCV's built-in Haar cascade as a lightweight detector for collection.
-    For the actual recognition pipeline we use RetinaFace — but for collection
-    we just need a fast detector to find and crop the face region."""
-    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    return cv2.CascadeClassifier(cascade_path)
+    """
+    Load InsightFace FaceAnalysis with detection-only module.
+    Uses buffalo_l pack → det_10g.onnx (RetinaFace-family SCRFD detector).
+    Outputs bounding boxes + 5 facial landmarks per face.
+    """
+    from insightface.app import FaceAnalysis
+    print("[DETECTOR] Loading RetinaFace (buffalo_l / det_10g.onnx) ...")
+    app = FaceAnalysis(
+        name="buffalo_l",
+        allowed_modules=["detection"],
+        providers=["CPUExecutionProvider"],
+    )
+    app.prepare(ctx_id=0, det_size=DET_SIZE)
+    print("[DETECTOR] Ready.\n")
+    return app
 
 
-def collect(name: str):
+def draw_landmarks(display: np.ndarray, kps: np.ndarray):
+    """Draw 5 facial landmarks on display frame."""
+    for pt in kps.astype(int):
+        cv2.circle(display, tuple(pt), 4, COL_CYAN, -1)
+
+
+def collect(name: str, photos_needed: int):
+    from insightface.utils import face_align
+
     person_dir = os.path.join(DATASET_DIR, name)
     os.makedirs(person_dir, exist_ok=True)
 
-    existing = len([f for f in os.listdir(person_dir) if f.endswith(".jpg")])
-    if existing >= PHOTOS_NEEDED:
+    existing = len([f for f in os.listdir(person_dir) if f.lower().endswith(".jpg")])
+    if existing >= photos_needed:
         print(f"[INFO] {name} already has {existing} photos. Delete the folder to re-collect.")
         return
 
     detector = load_face_detector()
+
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         raise RuntimeError("Cannot open webcam. Check if another app is using it.")
@@ -57,98 +98,137 @@ def collect(name: str):
     saved       = existing
     last_saved  = 0.0
     rejected    = 0
-    warmup      = 0          # counts discarded warmup frames
+    warmup      = 0
 
-    print(f"\n[START] Collecting photos for: {name}")
-    print(f"        Already have: {existing}/{PHOTOS_NEEDED}")
-    print(f"        Look at the camera. Photos will be saved automatically.")
+    print(f"[START] Collecting aligned photos for: {name}")
+    print(f"        Already have : {existing}/{photos_needed}")
+    print(f"        Move your head slightly between captures for variety.")
     print(f"        Press Q to quit early.\n")
 
-    while saved < PHOTOS_NEEDED:
+    while saved < photos_needed:
         ret, frame = cap.read()
         if not ret:
             continue
 
-        # Discard first WARMUP_FRAMES so camera exposure/focus settles
+        # ── Warmup ────────────────────────────────────────────────────────────
         if warmup < WARMUP_FRAMES:
             warmup += 1
-            cv2.putText(frame, f"Warming up... {warmup}/{WARMUP_FRAMES}", (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (100, 100, 255), 2)
+            cv2.putText(frame, f"Warming up... {warmup}/{WARMUP_FRAMES}", (20, 45),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (100, 100, 255), 2)
             cv2.imshow("Dataset Collection — press Q to quit", frame)
             cv2.waitKey(1)
             continue
 
         display = frame.copy()
-        gray    = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces   = detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5,
-                                            minSize=(FACE_MIN_SIZE, FACE_MIN_SIZE))
+        faces   = detector.get(frame)
 
-        status_color = (0, 200, 100)  # green
+        # Filter by detection threshold
+        faces = [f for f in faces if f.det_score >= DET_THRESH]
 
-        if len(faces) == 0:
-            status_color = (0, 100, 255)
-            cv2.putText(display, "No face detected", (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
+        if not faces:
+            cv2.putText(display, "No face detected", (20, 45),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, COL_AMBER, 2)
 
         else:
-            # If multiple faces, pick the largest (closest to camera) and proceed
+            # Use highest-confidence face
+            face  = max(faces, key=lambda f: f.det_score)
+            bbox  = face.bbox.astype(int)
+            x1, y1, x2, y2 = bbox[0], bbox[1], bbox[2], bbox[3]
+            w, h  = x2 - x1, y2 - y1
+
             if len(faces) > 1:
-                faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
-                cv2.putText(display, "Multiple faces — using largest", (20, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (30, 200, 255), 2)
+                cv2.putText(display, "Multiple faces — using best", (20, 45),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, COL_AMBER, 2)
 
-            x, y, w, h = faces[0]
-            # Expand crop slightly for context
-            pad   = int(0.2 * max(w, h))
-            x1    = max(0, x - pad)
-            y1    = max(0, y - pad)
-            x2    = min(frame.shape[1], x + w + pad)
-            y2    = min(frame.shape[0], y + h + pad)
+            if min(w, h) < FACE_MIN_SIZE:
+                cv2.putText(display, "Move closer to the camera", (20, 45),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, COL_AMBER, 2)
+                cv2.rectangle(display, (x1, y1), (x2, y2), COL_AMBER, 2)
 
-            face_crop  = frame[y1:y2, x1:x2]
-            face_gray  = gray[y1:y2, x1:x2]
-            sharpness  = laplacian_sharpness(face_gray)
+            else:
+                # ── norm_crop: landmark-based affine alignment ──────────────
+                try:
+                    aligned = face_align.norm_crop(frame, face.kps, image_size=112)
+                except Exception as e:
+                    cv2.putText(display, f"Alignment error: {e}", (20, 45),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, COL_RED, 1)
+                    cv2.imshow("Dataset Collection — press Q to quit", display)
+                    cv2.waitKey(1)
+                    continue
 
-            # Draw bounding box
-            cv2.rectangle(display, (x1, y1), (x2, y2), status_color, 2)
-            cv2.putText(display, f"Sharpness: {sharpness:.0f}", (x1, y1 - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, status_color, 1)
+                gray_aligned = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY)
+                sharpness    = laplacian_sharpness(gray_aligned)
+                col          = COL_GREEN if sharpness >= MIN_SHARPNESS else COL_RED
 
-            now = time.time()
-            if sharpness >= MIN_SHARPNESS and (now - last_saved) >= CAPTURE_DELAY:
-                filename = os.path.join(person_dir, f"{name}_{saved+1:02d}.jpg")
-                # Save the face crop (112x112 — standard ArcFace input size)
-                face_resized = cv2.resize(face_crop, (112, 112))
-                cv2.imwrite(filename, face_resized)
-                saved      += 1
-                last_saved  = now
-                print(f"  [SAVED] {saved}/{PHOTOS_NEEDED}  sharpness={sharpness:.0f}  → {filename}")
-            elif sharpness < MIN_SHARPNESS:
-                status_color = (0, 100, 255)
-                rejected    += 1
-                cv2.putText(display, "Too blurry", (x1, y2 + 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, status_color, 1)
+                # Bounding box + sharpness label
+                cv2.rectangle(display, (x1, y1), (x2, y2), col, 2)
+                cv2.putText(display, f"Score:{face.det_score:.2f}  Sharp:{sharpness:.0f}",
+                            (x1, max(y1 - 10, 14)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
 
-        # HUD
-        cv2.putText(display, f"{name}  {saved}/{PHOTOS_NEEDED} saved",
-                    (20, display.shape[0] - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                # Facial landmarks
+                draw_landmarks(display, face.kps)
+
+                # Aligned face preview (top-right corner)
+                ph = 90
+                preview = cv2.resize(aligned, (ph, ph))
+                px_off  = display.shape[1] - ph - 10
+                display[10:10+ph, px_off:px_off+ph] = preview
+                cv2.rectangle(display, (px_off-1, 9), (px_off+ph, 10+ph), COL_CYAN, 1)
+                cv2.putText(display, "aligned", (px_off, 10+ph+13),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, COL_CYAN, 1)
+
+                now = time.time()
+                if sharpness >= MIN_SHARPNESS and (now - last_saved) >= CAPTURE_DELAY:
+                    fname = os.path.join(person_dir, f"{name}_{saved+1:02d}.jpg")
+                    cv2.imwrite(fname, aligned)   # save aligned 112×112 BGR crop
+                    saved     += 1
+                    last_saved = now
+                    print(f"  [SAVED] {saved}/{photos_needed}  "
+                          f"sharp={sharpness:.0f}  det={face.det_score:.2f}  → {fname}")
+                elif sharpness < MIN_SHARPNESS:
+                    rejected += 1
+                    cv2.putText(display, "Too blurry — hold still", (x1, y2 + 22),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, COL_RED, 1)
+
+        # ── HUD ───────────────────────────────────────────────────────────────
+        h_frame = display.shape[0]
+        cv2.putText(display,
+                    f"{name}  |  {saved}/{photos_needed} saved  |  {rejected} rejected",
+                    (20, h_frame - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, COL_WHITE, 2)
+        cv2.putText(display, "Detector: RetinaFace + norm_crop alignment",
+                    (20, h_frame - 45),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (160, 160, 160), 1)
+
+        # Progress bar
+        bar_w    = int((saved / photos_needed) * 400)
+        cv2.rectangle(display, (20, h_frame - 65), (420, h_frame - 55), (60, 60, 60), -1)
+        cv2.rectangle(display, (20, h_frame - 65), (20 + bar_w, h_frame - 55), COL_GREEN, -1)
 
         cv2.imshow("Dataset Collection — press Q to quit", display)
         if cv2.waitKey(1) & 0xFF == ord("q"):
-            print("[QUIT] Stopped early.")
+            print("\n[QUIT] Stopped early.")
             break
 
     cap.release()
     cv2.destroyAllWindows()
 
-    print(f"\n[DONE] Saved {saved} photos for {name}.")
+    print(f"\n[DONE] Saved {saved}/{photos_needed} aligned photos for '{name}'.")
     if rejected > 0:
         print(f"       {rejected} blurry frames were auto-rejected.")
+    if saved == photos_needed:
+        print(f"\n  Next step:")
+        print(f"    python scripts/extract_embeddings.py")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--name", required=True, help="Person's name (no spaces recommended)")
+    parser = argparse.ArgumentParser(
+        description="Collect aligned face photos using RetinaFace + norm_crop."
+    )
+    parser.add_argument("--name",   required=True,
+                        help="Person's name (no spaces recommended, e.g. Jennifer)")
+    parser.add_argument("--photos", type=int, default=PHOTOS_NEEDED,
+                        help=f"Number of photos to collect (default: {PHOTOS_NEEDED})")
     args = parser.parse_args()
-    collect(args.name.strip())
+    collect(args.name.strip(), args.photos)

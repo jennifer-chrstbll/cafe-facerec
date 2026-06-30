@@ -40,6 +40,8 @@ def get_person_images(person_name: str):
     """Return list of BGR images for a person."""
     folder = os.path.join(DATASET_DIR, person_name)
     images = []
+    # NOTE: images in dataset/ are expected to be pre-aligned 112x112
+    # crops from collect_dataset.py (norm_crop). Do not mix with raw photos.
     for fname in sorted(os.listdir(folder)):
         if fname.lower().endswith((".jpg", ".jpeg", ".png")):
             path = os.path.join(folder, fname)
