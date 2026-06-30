@@ -2,18 +2,20 @@
 live_demo.py
 ------------
 Live webcam demo using the best model from evaluation.
-Simulates the cafe cashier display:
-    - Known customer  → show name + visit count + top-3 menu recs
-    - Unknown         → show "New Customer" prompt
+Pipeline: RetinaFace detection → norm_crop alignment → embedding → FAISS 1:N search
 
-Usage:
-    python scripts/live_demo.py --model arcface --threshold 0.35
-    python scripts/live_demo.py --model arcface   (uses threshold from evaluate results)
+Recognition modes:
+  - Known customer  → name + confidence + visit count + top-3 menu recs
+  - New customer    → "Customer Baru" prompt + enroll option
 
 Controls:
-    Q — quit
-    E — enroll current face as new person (type name in terminal)
-    D — delete last enrollment
+  Q — quit
+  E — enroll current face as new person (look at camera, press E, type name)
+  D — delete last live-enrolled person
+
+Usage:
+  python scripts/live_demo.py --model arcface --threshold 0.38
+  python scripts/live_demo.py --model magface   (auto-loads threshold from evaluate results)
 """
 
 import cv2
@@ -22,61 +24,76 @@ import sys
 import argparse
 import time
 import json
+import csv
+import requests
 import numpy as np
+from datetime import datetime
 
 PROJECT_ROOT   = r"D:\Projects\cafe_facerec"
 EMBEDDINGS_DIR = os.path.join(PROJECT_ROOT, "embeddings")
 RESULTS_DIR    = os.path.join(PROJECT_ROOT, "results")
 DEMO_DB_PATH   = os.path.join(PROJECT_ROOT, "demo_db.json")
+ATTENDANCE_CSV = os.path.join(PROJECT_ROOT, "attendance.csv")
+CRM_API_URL = "http://127.0.0.1:8000/recognition/search"
 sys.path.insert(0, PROJECT_ROOT)
 
-# ── Display config ────────────────────────────────────────────────────────────
-WINDOW_W       = 1000
-PANEL_W        = 340          # right-side info panel width
-CAM_W          = WINDOW_W - PANEL_W
-FONT           = cv2.FONT_HERSHEY_SIMPLEX
+# ── FAISS (optional — graceful fallback) ──────────────────────────────────────
+try:
+    import faiss
+    USE_FAISS = True
+except ImportError:
+    USE_FAISS = False
+    print("[WARN] faiss not installed. Falling back to numpy cosine search.")
+    print("       Install with: pip install faiss-cpu")
 
-COL_GREEN  = (80,  210, 100)
+# ── Display config ────────────────────────────────────────────────────────────
+WINDOW_W  = 1080
+PANEL_W   = 340
+CAM_W     = WINDOW_W - PANEL_W
+FONT      = cv2.FONT_HERSHEY_SIMPLEX
+
+COL_GREEN  = (70,  210,  90)
 COL_AMBER  = (30,  190, 255)
 COL_RED    = (60,   60, 220)
 COL_WHITE  = (230, 230, 230)
-COL_DARK   = (30,   30,  30)
-COL_PANEL  = (20,   20,  20)
+COL_DARK   = (25,   25,  25)
+COL_PANEL  = (18,   18,  18)
+COL_CYAN   = (230, 200,   0)
+COL_GRAY   = (120, 120, 120)
 
-# Simulated order history (replace with real DB later in Phase 3)
-MOCK_ORDERS = {
-    "Jennifer": ["Matcha Latte", "Croissant", "Matcha Latte", "Iced Americano", "Matcha Latte"],
-    "Teo":      ["Espresso", "Espresso", "Blueberry Muffin", "Espresso"],
+# ── Mock order history (replace with real DB in production) ───────────────────
+MOCK_ORDERS: dict[str, list[str]] = {
+    "Jennifer": ["Matcha Latte", "Croissant", "Matcha Latte", "Iced Americano",
+                 "Matcha Latte", "Croissant"],
+    "Mama":     ["Cappuccino", "Blueberry Muffin", "Cappuccino", "Chocolate Cake"],
+    "Koko":     ["Espresso", "Espresso", "Americano", "Espresso", "Croissant"],
 }
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def load_threshold(model_key: str) -> float:
-    """Load EER threshold saved by evaluate.py."""
     path = os.path.join(RESULTS_DIR, f"{model_key}_results.txt")
     if os.path.exists(path):
         with open(path) as f:
             for line in f:
                 if line.startswith("eer_threshold"):
                     return float(line.split(":")[1].strip())
-    return 0.35   # sensible default
+    return 0.35
 
 
-def top3_recs(name: str) -> list:
-    """Return top-3 recommended menu items based on order frequency."""
+def top3_recs(name: str) -> list[str]:
+    from collections import Counter
     orders = MOCK_ORDERS.get(name, [])
     if not orders:
         return ["Espresso", "Latte", "Croissant"]
-    from collections import Counter
-    counts = Counter(orders)
-    return [item for item, _ in counts.most_common(3)]
+    return [item for item, _ in Counter(orders).most_common(3)]
 
 
-def load_demo_db():
+def load_demo_db() -> dict:
     if os.path.exists(DEMO_DB_PATH):
         with open(DEMO_DB_PATH) as f:
             db = json.load(f)
-        # Convert lists back to np arrays
         for k in db:
             db[k]["embeddings"] = [np.array(e, dtype=np.float32)
                                    for e in db[k]["embeddings"]]
@@ -84,141 +101,227 @@ def load_demo_db():
     return {}
 
 
-def save_demo_db(db):
-    serialisable = {}
-    for k, v in db.items():
-        serialisable[k] = {
-            "visit_count": v["visit_count"],
-            "embeddings":  [e.tolist() for e in v["embeddings"]],
-        }
+def save_demo_db(db: dict):
+    serialisable = {
+        k: {"visit_count": v["visit_count"],
+            "embeddings":  [e.tolist() for e in v["embeddings"]]}
+        for k, v in db.items()
+    }
     with open(DEMO_DB_PATH, "w") as f:
         json.dump(serialisable, f, indent=2)
 
 
+def log_attendance(name: str, score: float):
+    """Append a visit record to attendance.csv."""
+    is_new = not os.path.exists(ATTENDANCE_CSV)
+    with open(ATTENDANCE_CSV, "a", newline="") as f:
+        writer = csv.writer(f)
+        if is_new:
+            writer.writerow(["timestamp", "name", "confidence"])
+        writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), name, f"{score:.4f}"])
+
+
+# ── Gallery ───────────────────────────────────────────────────────────────────
+
 def build_gallery(model_key: str, demo_db: dict):
     """
     Build gallery from:
-        1. Saved .npy embeddings (from extract_embeddings.py)
-        2. Live enrollments stored in demo_db
-    Returns: (names_list, embs_array)
-    """
-    names, embs = [], []
+      1. Saved .npy embeddings (from extract_embeddings.py) — ALL 10 per person
+      2. Live enrollments in demo_db
 
-    # From .npy files
+    Returns: (labels_list, embs_array, faiss_index_or_None)
+      labels_list : list[str]      — one name per embedding row
+      embs_array  : np.ndarray     — shape (N_total, 512)
+      index       : faiss index or None
+    """
+    labels: list[str] = []
+    embs:   list[np.ndarray] = []
+
+    # Load from .npy files (individual embeddings — NOT mean)
     model_dir = os.path.join(EMBEDDINGS_DIR, model_key)
     if os.path.isdir(model_dir):
         for fname in sorted(os.listdir(model_dir)):
             if not fname.endswith(".npy"):
                 continue
             person = fname[:-4]
-            arr    = np.load(os.path.join(model_dir, fname))
-            # Use mean embedding as representative (more stable than any single photo)
-            mean_emb = arr.mean(axis=0)
-            mean_emb = mean_emb / (np.linalg.norm(mean_emb) + 1e-10)
-            names.append(person)
-            embs.append(mean_emb)
+            arr = np.load(os.path.join(model_dir, fname))   # (n_photos, 512)
+            for emb in arr:
+                labels.append(person)
+                embs.append(emb.astype(np.float32))
 
-    # From demo_db live enrollments
+    # Live-enrolled customers from demo_db
     for person, data in demo_db.items():
-        if person in names:
-            continue   # already loaded from .npy
-        arr      = np.stack(data["embeddings"])
-        mean_emb = arr.mean(axis=0)
-        mean_emb = mean_emb / (np.linalg.norm(mean_emb) + 1e-10)
-        names.append(person)
-        embs.append(mean_emb)
+        if person in set(labels):
+            continue  # already loaded from .npy
+        for emb in data["embeddings"]:
+            labels.append(person)
+            embs.append(np.array(emb, dtype=np.float32))
 
     if not embs:
-        return [], np.zeros((0, 512), dtype=np.float32)
-    return names, np.stack(embs).astype(np.float32)
+        return [], np.zeros((0, 512), dtype=np.float32), None
+
+    embs_np = np.stack(embs).astype(np.float32)   # (N_total, 512)
+
+    # Build FAISS index
+    index = None
+    if USE_FAISS and embs_np.shape[0] > 0:
+        index = faiss.IndexFlatIP(embs_np.shape[1])
+        index.add(embs_np)
+
+    return labels, embs_np, index
 
 
-def identify(probe_emb, gallery_names, gallery_embs, threshold):
+def identify(probe_emb: np.ndarray,
+             g_labels: list,
+             gallery_embs: np.ndarray,
+             index,
+             threshold: float):
     """
-    Returns (name, score) if above threshold, else (None, score).
+    1:N nearest-neighbor identification.
+    Uses FAISS if available, else numpy dot-product.
+    Returns (name_or_None, score).
     """
-    if len(gallery_names) == 0:
+    if not g_labels:
         return None, 0.0
-    sims    = gallery_embs @ probe_emb          # cosine (already L2-normed)
-    idx     = int(np.argmax(sims))
-    score   = float(sims[idx])
+
+    if USE_FAISS and index is not None:
+        D, I = index.search(probe_emb.reshape(1, -1), k=1)
+        score = float(D[0][0])
+        idx   = int(I[0][0])
+    else:
+        sims  = gallery_embs @ probe_emb
+        idx   = int(np.argmax(sims))
+        score = float(sims[idx])
+
     if score >= threshold:
-        return gallery_names[idx], score
+        return g_labels[idx], score
     return None, score
 
 
-# ── Panel drawing ──────────────────────────────────────────────────────────────
+# ── Panel drawing ─────────────────────────────────────────────────────────────
 
-def draw_panel(canvas, name, score, visit_count, recs, threshold, fps):
+def draw_panel(canvas: np.ndarray, name, score: float, visit_count: int,
+               recs: list, threshold: float, fps: float, model_key: str,
+               last_logged: float):
     h, w = canvas.shape[:2]
-    px   = WINDOW_W - PANEL_W   # panel starts here
+    px   = WINDOW_W - PANEL_W
 
-    # Panel background
     cv2.rectangle(canvas, (px, 0), (w, h), COL_PANEL, -1)
-    cv2.line(canvas, (px, 0), (px, h), (60, 60, 60), 1)
+    cv2.line(canvas, (px, 0), (px, h), (55, 55, 55), 1)
 
-    y = 30
+    y = 28
 
-    def txt(text, size=0.55, color=COL_WHITE, bold=False):
+    def txt(text, size=0.52, color=COL_WHITE, bold=False):
         nonlocal y
-        thickness = 2 if bold else 1
-        cv2.putText(canvas, text, (px + 14, y), FONT, size, color, thickness, cv2.LINE_AA)
-        y += int(size * 38)
+        cv2.putText(canvas, text, (px + 14, y), FONT, size,
+                    color, 2 if bold else 1, cv2.LINE_AA)
+        y += max(18, int(size * 36))
 
-    def divider():
+    def divider(gap=10):
         nonlocal y
-        cv2.line(canvas, (px + 10, y), (w - 10, y), (60, 60, 60), 1)
-        y += 14
+        y += gap // 2
+        cv2.line(canvas, (px + 10, y), (w - 10, y), (50, 50, 50), 1)
+        y += gap // 2 + 6
 
-    txt("CAFE FACEREC", 0.65, COL_GREEN, bold=True)
-    txt(f"Model threshold: {threshold:.3f}", 0.42, (130, 130, 130))
+    txt("CAFE FACEREC", 0.62, COL_GREEN, bold=True)
+    txt(f"Model: {model_key.upper()}", 0.38, COL_GRAY)
+    txt(f"Threshold: {threshold:.3f}", 0.38, COL_GRAY)
     divider()
 
     if name:
-        txt(f"Halo Kak {name}!", 0.7, COL_GREEN, bold=True)
-        txt(f"Confidence : {score:.3f}", 0.5, COL_WHITE)
-        txt(f"Visits     : {visit_count}", 0.5, COL_WHITE)
+        txt(f"Halo, Kak {name}!", 0.68, COL_GREEN, bold=True)
+        txt(f"Confidence : {score:.3f}", 0.48, COL_WHITE)
+        txt(f"Visits     : {visit_count}", 0.48, COL_WHITE)
         divider()
-        txt("Rekomendasi:", 0.55, COL_AMBER, bold=True)
+        txt("Top Rekomendasi:", 0.52, COL_AMBER, bold=True)
         y += 4
-        for i, item in enumerate(recs, 1):
-            txt(f"  {i}. {item}", 0.52, COL_WHITE)
+        icons = ["1.", "2.", "3."]
+        for i, item in enumerate(recs[:3]):
+            txt(f"  {icons[i]} {item}", 0.48, COL_WHITE)
+
+        # Cooldown indicator
+        elapsed = time.time() - last_logged
+        cooldown = 30.0  # seconds before logging same person again
+        if elapsed < cooldown:
+            remaining = cooldown - elapsed
+            txt(f"  (log in {remaining:.0f}s)", 0.36, COL_GRAY)
     else:
-        txt("Customer Baru", 0.65, COL_AMBER, bold=True)
-        txt(f"Best score : {score:.3f}", 0.5, (160, 160, 160))
+        txt("Customer Baru", 0.62, COL_AMBER, bold=True)
+        txt(f"Best score : {score:.3f}", 0.46, COL_GRAY)
         divider()
-        txt("Tekan E untuk", 0.5, COL_WHITE)
-        txt("enroll wajah baru", 0.5, COL_WHITE)
+        txt("Tekan E untuk", 0.48, COL_WHITE)
+        txt("enroll wajah baru.", 0.48, COL_WHITE)
 
     divider()
-    txt(f"FPS: {fps:.1f}", 0.45, (120, 120, 120))
+    txt(f"FPS: {fps:.1f}", 0.42, COL_GRAY)
+    txt(f"Gallery: FAISS" if USE_FAISS else "Gallery: numpy", 0.38, COL_GRAY)
 
 
-def draw_face_box(frame, x1, y1, x2, y2, name, score, threshold):
+def draw_face_box(cam_frame: np.ndarray, x1: int, y1: int, x2: int, y2: int,
+                  name, score: float, kps: np.ndarray = None):
     color = COL_GREEN if name else COL_AMBER
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-    label = f"{name} | {score:.2f}" if name else f"Unknown | {score:.2f}"
-    (tw, th), _ = cv2.getTextSize(label, FONT, 0.55, 1)
-    cv2.rectangle(frame, (x1, y1 - th - 8), (x1 + tw + 6, y1), color, -1)
-    cv2.putText(frame, label, (x1 + 3, y1 - 4), FONT, 0.55, COL_DARK, 1, cv2.LINE_AA)
+    cv2.rectangle(cam_frame, (x1, y1), (x2, y2), color, 2)
+    label = f"{name} {score:.2f}" if name else f"Unknown {score:.2f}"
+    (tw, th), _ = cv2.getTextSize(label, FONT, 0.52, 1)
+    cv2.rectangle(cam_frame, (x1, y1 - th - 10), (x1 + tw + 8, y1), color, -1)
+    cv2.putText(cam_frame, label, (x1 + 4, y1 - 5), FONT, 0.52, COL_DARK, 1, cv2.LINE_AA)
+    # Draw landmarks
+    if kps is not None:
+        for pt in kps.astype(int):
+            # Scale landmark to cam_frame coords
+            cv2.circle(cam_frame, tuple(pt), 3, COL_CYAN, -1)
 
+def search_customer_api(
+    embedding: np.ndarray
+):
+    try:
+
+        response = requests.post(
+            CRM_API_URL,
+            json={
+                "embedding": embedding.tolist()
+            },
+            timeout=5
+        )
+
+        if response.status_code != 200:
+            return None
+
+        return response.json()
+
+    except Exception as e:
+
+        print(
+            "[API ERROR]",
+            e
+        )
+
+        return None
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def run(model_key: str, threshold: float):
+    from insightface.app import FaceAnalysis
+    from insightface.utils import face_align
     from models import load_model
 
-    print(f"\n[INIT] Loading model: {model_key}")
-    model = load_model(model_key)
+    print(f"\n[INIT] Loading recognition model: {model_key}")
+    rec_model = load_model(model_key)
 
-    # Face detector (Haar cascade for speed in live demo)
-    detector    = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    print("[INIT] Loading RetinaFace detector (buffalo_l/det_10g.onnx) ...")
+    detector = FaceAnalysis(
+        name="buffalo_l",
+        allowed_modules=["detection"],
+        providers=["CPUExecutionProvider"],
     )
+    detector.prepare(ctx_id=0, det_size=(640, 640))
+    print("[INIT] Detector ready.")
 
-    demo_db     = load_demo_db()
-    g_names, g_embs = build_gallery(model_key, demo_db)
-    print(f"[INIT] Gallery loaded: {len(g_names)} people → {g_names}")
+    demo_db = load_demo_db()
+    g_labels, g_embs, g_index = build_gallery(model_key, demo_db)
+    people_set = sorted(set(g_labels))
+    print(f"[INIT] Gallery: {len(g_labels)} embeddings | {len(people_set)} people → {people_set}")
+    print(f"[INIT] Search : {'FAISS IndexFlatIP' if USE_FAISS else 'numpy dot-product'}")
     print(f"[INIT] Threshold: {threshold:.4f}")
     print(f"\n  Controls: Q=quit  E=enroll new person  D=delete last enrolled\n")
 
@@ -226,17 +329,22 @@ def run(model_key: str, threshold: float):
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-    # Recognition state (update every N frames for performance)
-    RECOG_INTERVAL = 5    # run recognition every 5 frames
+    RECOG_INTERVAL = 4      # run recognition every N frames
     frame_count    = 0
     last_name      = None
     last_score     = 0.0
+    last_kps       = None
+    last_bbox      = None
     fps_time       = time.time()
     fps            = 0.0
 
-    # Enroll buffer
-    enroll_buffer  = []
-    enrolling      = False
+    # Attendance dedup: track last log time per person
+    last_logged_time: dict[str, float] = {}
+    LOG_COOLDOWN = 30.0   # minimum seconds between logging same person
+
+    # Enrollment
+    enroll_buffer: list[np.ndarray] = []
+    enrolling = False
 
     while True:
         ret, frame = cap.read()
@@ -244,93 +352,127 @@ def run(model_key: str, threshold: float):
             continue
 
         frame_count += 1
-        display      = frame.copy()
-        gray         = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # Resize frame area to CAM_W
         cam_h = int(frame.shape[0] * CAM_W / frame.shape[1])
-        cam_frame = cv2.resize(display, (CAM_W, cam_h))
+        cam_frame = cv2.resize(frame.copy(), (CAM_W, cam_h))
 
-        # Detect faces
-        faces = detector.detectMultiScale(gray, 1.1, 5, minSize=(80, 80))
+        scale_x = CAM_W / frame.shape[1]
+        scale_y = cam_h / frame.shape[0]
 
-        if len(faces) == 1 and frame_count % RECOG_INTERVAL == 0:
-            x, y, w, h = faces[0]
-            pad  = int(0.15 * max(w, h))
-            x1   = max(0, x - pad);  y1 = max(0, y - pad)
-            x2   = min(frame.shape[1], x + w + pad)
-            y2   = min(frame.shape[0], y + h + pad)
-            crop = frame[y1:y2, x1:x2]
+        # ── Detection + Recognition every RECOG_INTERVAL frames ───────────────
+        if frame_count % RECOG_INTERVAL == 0:
+            faces = detector.get(frame)
+            faces = [f for f in faces if f.det_score >= 0.5]
 
-            t0        = time.perf_counter()
-            probe_emb = model.get_embedding(crop)
-            lat_ms    = (time.perf_counter() - t0) * 1000
+            if faces:
+                face   = max(faces, key=lambda f: f.det_score)
+                bbox   = face.bbox.astype(int)
+                last_bbox = bbox
 
-            if probe_emb is not None:
-                last_name, last_score = identify(probe_emb, g_names, g_embs, threshold)
+                try:
+                    aligned   = face_align.norm_crop(frame, face.kps, image_size=112)
+                    probe_emb = rec_model.get_embedding(aligned)
+                    last_kps  = (face.kps * np.array([scale_x, scale_y])).astype(int)
+                except Exception:
+                    probe_emb = None
 
-                if enrolling:
-                    enroll_buffer.append(probe_emb)
+                if probe_emb is not None:
+                    result = search_customer_api(
+                        probe_emb
+                    )
 
-            # Scale face box to cam_frame coords
-            scale_x = CAM_W / frame.shape[1]
-            scale_y = cam_h / frame.shape[0]
-            sx1 = int(x1 * scale_x); sy1 = int(y1 * scale_y)
-            sx2 = int(x2 * scale_x); sy2 = int(y2 * scale_y)
-            draw_face_box(cam_frame, sx1, sy1, sx2, sy2, last_name, last_score, threshold)
+                    if result:
 
-        # Build canvas
-        canvas = np.zeros((max(cam_h, 500), WINDOW_W, 3), dtype=np.uint8)
+                        if result["recognized"]:
+
+                            last_name = result["customer_name"]
+
+                            last_score = result["score"]
+
+                        else:
+
+                            last_name = None
+
+                            last_score = result["score"]
+
+                    # Attendance logging with cooldown
+                    if last_name:
+                        now = time.time()
+                        last_t = last_logged_time.get(last_name, 0.0)
+                        if (now - last_t) >= LOG_COOLDOWN:
+                            log_attendance(last_name, last_score)
+                            last_logged_time[last_name] = now
+                            demo_db.setdefault(last_name, {"visit_count": 0, "embeddings": []})
+                            demo_db[last_name]["visit_count"] += 1
+                            save_demo_db(demo_db)
+
+                    if enrolling:
+                        enroll_buffer.append(probe_emb)
+            else:
+                last_bbox = None
+                last_kps  = None
+                last_name = None
+                last_score = 0.0
+
+        # ── Draw face box on cam_frame ─────────────────────────────────────────
+        if last_bbox is not None:
+            x1 = int(last_bbox[0] * scale_x)
+            y1 = int(last_bbox[1] * scale_y)
+            x2 = int(last_bbox[2] * scale_x)
+            y2 = int(last_bbox[3] * scale_y)
+            draw_face_box(cam_frame, x1, y1, x2, y2, last_name, last_score, last_kps)
+
+        # ── Build canvas ──────────────────────────────────────────────────────
+        canvas = np.full((max(cam_h, 520), WINDOW_W, 3), COL_DARK, dtype=np.uint8)
         canvas[:cam_h, :CAM_W] = cam_frame
 
-        # Visit count + recs
-        visit_count = demo_db.get(last_name, {}).get("visit_count", 1) if last_name else 0
-        recs        = top3_recs(last_name) if last_name else []
+        # ── Panel ─────────────────────────────────────────────────────────────
+        visit_count  = demo_db.get(last_name, {}).get("visit_count", 1) if last_name else 0
+        recs         = top3_recs(last_name) if last_name else []
+        last_log_t   = last_logged_time.get(last_name, 0.0) if last_name else 0.0
 
-        # FPS
         now      = time.time()
         fps      = 1.0 / max(now - fps_time, 0.001)
         fps_time = now
 
-        draw_panel(canvas, last_name, last_score, visit_count, recs, threshold, fps)
+        draw_panel(canvas, last_name, last_score, visit_count, recs,
+                   threshold, fps, model_key, last_log_t)
 
+        # ── Enrollment status overlay ──────────────────────────────────────────
         if enrolling:
-            msg = f"Enrolling... {len(enroll_buffer)} frames collected. Press E again to finish."
-            cv2.putText(canvas, msg, (10, 30), FONT, 0.55, COL_AMBER, 2, cv2.LINE_AA)
+            msg = f"ENROLLING... {len(enroll_buffer)} frames. Press E to finish."
+            cv2.putText(canvas, msg, (10, cam_h - 12), FONT, 0.55, COL_AMBER, 2, cv2.LINE_AA)
 
         cv2.imshow("Cafe FaceRec — Live Demo", canvas)
         key = cv2.waitKey(1) & 0xFF
 
-        # ── Key controls ──
+        # ── Key controls ──────────────────────────────────────────────────────
         if key == ord("q"):
             break
 
         elif key == ord("e"):
             if not enrolling:
-                # Start enrollment
                 enrolling     = True
                 enroll_buffer = []
-                print("\n[ENROLL] Started. Look at camera for 3-4 seconds. Press E again to save.")
-
+                print("\n[ENROLL] Started. Look at camera ~3 seconds. Press E again to save.")
             else:
-                # Finish enrollment
                 if len(enroll_buffer) >= 3:
                     print("[ENROLL] Enter name: ", end="", flush=True)
-                    name = input().strip()
-                    if name:
-                        if name not in demo_db:
-                            demo_db[name] = {"visit_count": 0, "embeddings": []}
-                        demo_db[name]["embeddings"].extend(enroll_buffer)
-                        demo_db[name]["visit_count"] += 1
+                    enroll_name = input().strip()
+                    if enroll_name:
+                        if enroll_name not in demo_db:
+                            demo_db[enroll_name] = {"visit_count": 0, "embeddings": []}
+                        demo_db[enroll_name]["embeddings"].extend(enroll_buffer)
+                        demo_db[enroll_name]["visit_count"] += 1
                         save_demo_db(demo_db)
                         # Rebuild gallery
-                        g_names, g_embs = build_gallery(model_key, demo_db)
-                        print(f"[ENROLL] Saved {len(enroll_buffer)} embeddings for '{name}'.")
-                        print(f"[GALLERY] Now {len(g_names)} people: {g_names}")
+                        g_labels, g_embs, g_index = build_gallery(model_key, demo_db)
+                        people_set = sorted(set(g_labels))
+                        print(f"[ENROLL] Saved {len(enroll_buffer)} embeddings for '{enroll_name}'.")
+                        print(f"[GALLERY] Now {len(people_set)} people: {people_set}")
                     else:
-                        print("[ENROLL] Cancelled — empty name.")
+                        print("[ENROLL] Cancelled.")
                 else:
-                    print(f"[ENROLL] Only {len(enroll_buffer)} frames — need at least 3. Try again.")
+                    print(f"[ENROLL] Only {len(enroll_buffer)} frames — need ≥ 3. Try again.")
                 enrolling     = False
                 enroll_buffer = []
 
@@ -339,22 +481,22 @@ def run(model_key: str, threshold: float):
                 last_key = list(demo_db.keys())[-1]
                 del demo_db[last_key]
                 save_demo_db(demo_db)
-                g_names, g_embs = build_gallery(model_key, demo_db)
-                print(f"[DELETE] Removed '{last_key}' from demo DB.")
+                g_labels, g_embs, g_index = build_gallery(model_key, demo_db)
+                print(f"[DELETE] Removed '{last_key}' from demo_db.")
 
     cap.release()
     cv2.destroyAllWindows()
+    print(f"\n[DONE] Attendance log saved to: {ATTENDANCE_CSV}")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model",     default="arcface",
-                        help="Model to use: arcface, facenet, insightface, adaface, magface")
+    parser.add_argument("--model",     default="magface",
+                        help="Model: arcface, facenet_vgg, facenet_casia, adaface, magface")
     parser.add_argument("--threshold", default=None, type=float,
                         help="Cosine similarity threshold (default: load from evaluate results)")
     args = parser.parse_args()
-
     threshold = args.threshold if args.threshold else load_threshold(args.model)
     run(args.model, threshold)

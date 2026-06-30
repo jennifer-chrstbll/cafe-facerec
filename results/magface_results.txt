@@ -1,0 +1,11 @@
+model: magface
+n_people: 20
+n_embeddings: 200
+rank1: 1.0
+cmc: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+tar_at_far_1pct: 0.98
+tar_at_far_01pct: 0.9711111111111111
+eer: 0.018894736842105263
+eer_threshold: 0.2740952372534804
+genuine_mean: 0.8290073574913872
+impostor_mean: 0.0678493575608897

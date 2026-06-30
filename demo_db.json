@@ -1,0 +1,58 @@
+{
+  "Jennifer": {
+    "visit_count": 45,
+    "embeddings": []
+  },
+  "Monica": {
+    "visit_count": 8,
+    "embeddings": []
+  },
+  "Chitta": {
+    "visit_count": 4,
+    "embeddings": []
+  },
+  "Joce": {
+    "visit_count": 1,
+    "embeddings": []
+  },
+  "Gaby": {
+    "visit_count": 4,
+    "embeddings": []
+  },
+  "Quin": {
+    "visit_count": 1,
+    "embeddings": []
+  },
+  "Lishia": {
+    "visit_count": 2,
+    "embeddings": []
+  },
+  "Irene": {
+    "visit_count": 3,
+    "embeddings": []
+  },
+  "Grace": {
+    "visit_count": 2,
+    "embeddings": []
+  },
+  "Felix": {
+    "visit_count": 2,
+    "embeddings": []
+  },
+  "Chelsea": {
+    "visit_count": 1,
+    "embeddings": []
+  },
+  "Daniel": {
+    "visit_count": 1,
+    "embeddings": []
+  },
+  "Jeli": {
+    "visit_count": 2,
+    "embeddings": []
+  },
+  "Bing": {
+    "visit_count": 1,
+    "embeddings": []
+  }
+}
