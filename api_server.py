@@ -16,7 +16,7 @@ app = FastAPI(title="Cafe FaceRec CCTV & API")
 
 # Configuration
 CRM_API_URL = "http://127.0.0.1:8001/recognition/search"
-MODEL_KEY = os.getenv("FACEREC_MODEL", "magface")
+MODEL_KEY = os.getenv("FACEREC_MODEL", "arcface")
 RECOG_INTERVAL = 4 # Run recognition every N frames
 
 # Globals for camera and state
