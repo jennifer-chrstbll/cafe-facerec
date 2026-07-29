@@ -2,20 +2,26 @@
 extract_embeddings.py
 ---------------------
 Reads every photo in dataset/<person>/ folders,
-runs them through all 5 models, and saves embeddings to embeddings/.
+runs them through the specified model(s), and saves embeddings to embeddings/.
+
+Photos are expected to be 112x112 aligned crops produced by collect_dataset.py
+(SCRFD detection + insightface norm_crop alignment). Do NOT mix with raw photos.
 
 Output structure:
     embeddings/
         arcface/
-            Jennifer.npy      <- shape (10, 512)
+            Jennifer.npy      <- shape (n_photos, 512), L2-normalized float32
             Teo.npy
-        facenet/
+        facenet_vgg/
             Jennifer.npy
         ...
 
+For production (Fase 1), only arcface/ is used by FaceRecognitionModule.
+The other models are retained for evaluate.py benchmark (Bab IV).
+
 Usage:
-    python scripts/extract_embeddings.py
-    python scripts/extract_embeddings.py --model arcface   (single model)
+    python scripts/extract_embeddings.py                   (all 5 models)
+    python scripts/extract_embeddings.py --model arcface   (ArcFace only — fastest)
 """
 
 import os

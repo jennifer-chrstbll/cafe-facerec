@@ -1,26 +1,27 @@
 """
 models.py
 ---------
-Unified wrapper for all 5 face recognition models.
+Unified wrapper for all 5 face recognition models used in the benchmark.
 Each model exposes:
     get_embedding(bgr_image) -> np.ndarray (512-d, L2-normalised float32)
 
-Models (confirmed available, no extra downloads needed):
+Detector (shared, not in this file):
+    SCRFD-10GF — buffalo_l/det_10g.onnx via InsightFace FaceAnalysis.
+    "SCRFD" = Sample and Computation Redistribution for Efficient Face Detection
+    (Guo et al. 2021). This is what InsightFace buffalo_l actually uses —
+    NOT RetinaFace, despite historical comments in older versions of this file.
+
+Recognition models (benchmark — all 5 kept for evaluate.py / Bab IV):
     1. ArcFace      — R50,  WebFace600K,  ArcFace loss     (buffalo_l/w600k_r50.onnx)
     2. FaceNet-VGG  — InceptionResnetV1,  VGGFace2, Triplet (facenet-pytorch)
     3. FaceNet-CASIA— InceptionResnetV1,  CASIA-WebFace, Triplet (facenet-pytorch)
     4. AdaFace      — R100, Glint360K,    adaptive margin   (antelopev2/glintr100.onnx)
     5. MagFace      — MobileFaceNet,      WebFace600K       (buffalo_sc/w600k_mbf.onnx)
 
-Why these are genuinely distinct:
-    Model 1: ArcFace loss + margin-based angular softmax
-    Model 2: Triplet loss + VGGFace2 (celebrity-heavy, 3.3M images)
-    Model 3: Same architecture as Model 2 but CASIA-WebFace (10k identities,
-             500k images, more diverse) — measurably different embeddings
-    Model 4: R100 (deepest) + Glint360K (360M images, largest dataset here)
-    Model 5: MobileFaceNet (fastest, smallest) — IoT edge deployment candidate
+Production model (Fase 1+):
+    ArcFace (Model 1) — best EER (1.11%) in benchmark, used by FaceRecognitionModule.
 
-    This comparison has a clear thesis narrative:
+Benchmark narrative (Bab IV):
     "Does dataset size matter more than loss function? Does depth beat speed?"
 """
 
@@ -93,13 +94,52 @@ def _download_pack(pack_name: str):
     print(f"  [DL] Done → {pack_dir}")
 
 def _load_onnx(pack_name: str, filename: str):
+    """Load an InsightFace ONNX model via model_zoo (for SCRFD detector + non-ArcFace models)."""
     _download_pack(pack_name)
     onnx_path = _find_onnx(pack_name, filename)
     print(f"  [MODEL] {onnx_path}")
     from insightface.model_zoo import get_model
-    model = get_model(onnx_path, providers=["CPUExecutionProvider"])
+    import onnxruntime as ort
+    so = ort.SessionOptions()
+    so.enable_mem_pattern = False
+    model = get_model(onnx_path, session_options=so, providers=["CPUExecutionProvider"])
     model.prepare(-1)
     return model
+
+
+class _DirectArcFaceONNX:
+    """
+    Direct ONNXRuntime wrapper for ArcFace (buffalo_l / w600k_r50.onnx).
+
+    WHY this exists:
+    InsightFace's ArcFaceONNX.__init__ calls onnx.load(model_file) to parse the
+    174 MB protobuf BEFORE creating the session. When the SCRFD detector is
+    already loaded in the same process, the protobuf arena allocator fails with
+    "bad allocation". This class bypasses onnx.load() entirely — it creates the
+    ORT InferenceSession directly with enable_mem_pattern=False, which works.
+
+    Produces identical embeddings to ArcFaceONNX (same preprocessing: BGR→RGB,
+    normalize to [-1, 1], NCHW blob, run session, return (1, 512) float32).
+    """
+
+    def __init__(self, onnx_path: str):
+        import onnxruntime as ort
+        so = ort.SessionOptions()
+        so.enable_mem_pattern = False
+        self._session    = ort.InferenceSession(
+            onnx_path, sess_options=so, providers=["CPUExecutionProvider"]
+        )
+        self._input_name = self._session.get_inputs()[0].name
+        # buffalo_l w600k_r50.onnx: standard InsightFace normalization
+        self._input_mean = 127.5
+        self._input_std  = 127.5
+
+    def get_feat(self, bgr_img_112: np.ndarray) -> np.ndarray:
+        """Run ArcFace on a 112×112 BGR image. Returns (1, 512) float32."""
+        rgb  = cv2.cvtColor(bgr_img_112, cv2.COLOR_BGR2RGB).astype(np.float32)
+        blob = (rgb - self._input_mean) / self._input_std
+        blob = blob.transpose(2, 0, 1)[np.newaxis, :]   # → (1, 3, 112, 112)
+        return self._session.run(None, {self._input_name: blob})[0]
 
 def _load_facenet(pretrained: str):
     from facenet_pytorch import InceptionResnetV1
@@ -119,12 +159,19 @@ def _facenet_embed(model, bgr_img: np.ndarray) -> np.ndarray:
 # ── Model 1: ArcFace — R50, WebFace600K ──────────────────────────────────────
 
 class ArcFaceModel:
-    """buffalo_l/w600k_r50.onnx — R50, WebFace600K, ArcFace loss."""
+    """
+    buffalo_l/w600k_r50.onnx — R50, WebFace600K, ArcFace loss.
+    Uses _DirectArcFaceONNX to bypass InsightFace's onnx.load() parse
+    so it can co-exist with the SCRFD detector in the same process.
+    """
     name      = "ArcFace (R50, WebFace600K)"
     embed_dim = 512
 
     def __init__(self):
-        self.model = _load_onnx("buffalo_l", "w600k_r50.onnx")
+        _download_pack("buffalo_l")
+        onnx_path = _find_onnx("buffalo_l", "w600k_r50.onnx")
+        print(f"  [MODEL] {onnx_path}")
+        self.model = _DirectArcFaceONNX(onnx_path)
 
     def get_embedding(self, bgr_img: np.ndarray) -> np.ndarray:
         emb = self.model.get_feat(prep_112(bgr_img)).flatten()

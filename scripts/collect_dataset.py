@@ -4,8 +4,10 @@ collect_dataset.py
 Captures 10 face photos per person from your webcam.
 
 Pipeline:
-  1. RetinaFace detection (InsightFace buffalo_l/det_10g.onnx)
+  1. SCRFD detection (InsightFace buffalo_l/det_10g.onnx)
      → detects face bounding box + 5 facial landmarks
+     Note: SCRFD = Sample and Computation Redistribution for Efficient Face Detection
+     (Guo et al. 2021). InsightFace buffalo_l uses SCRFD, not RetinaFace.
   2. norm_crop (affine warp to canonical 112×112 pose)
      → both eyes at fixed coords, face upright regardless of head tilt
   3. Laplacian sharpness filter — reject blurry frames
@@ -33,8 +35,8 @@ MIN_SHARPNESS = 45.0        # Laplacian variance threshold (lower OK since align
 FACE_MIN_SIZE = 60          # minimum face bbox width/height in pixels
 CAPTURE_DELAY = 0.5         # seconds between auto-captures (for pose variety)
 WARMUP_FRAMES = 20          # discard first N frames for camera auto-exposure
-DET_THRESH    = 0.5         # RetinaFace detection confidence threshold
-DET_SIZE      = (320, 320)  # RetinaFace input size (lowered from 640 for faster CPU inference)
+DET_THRESH    = 0.5         # SCRFD detection confidence threshold
+DET_SIZE      = (320, 320)  # SCRFD input size (lowered from 640 for faster CPU inference)
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── Colors ────────────────────────────────────────────────────────────────────
@@ -54,11 +56,11 @@ def laplacian_sharpness(gray_img: np.ndarray) -> float:
 def load_face_detector():
     """
     Load InsightFace FaceAnalysis with detection-only module.
-    Uses buffalo_l pack → det_10g.onnx (RetinaFace-family SCRFD detector).
+    Uses buffalo_l pack → det_10g.onnx (SCRFD-10GF detector).
     Outputs bounding boxes + 5 facial landmarks per face.
     """
     from insightface.app import FaceAnalysis
-    print("[DETECTOR] Loading RetinaFace (buffalo_l / det_10g.onnx) ...")
+    print("[DETECTOR] Loading SCRFD (buffalo_l / det_10g.onnx) ...")
     app = FaceAnalysis(
         name="buffalo_l",
         allowed_modules=["detection"],
@@ -197,7 +199,7 @@ def collect(name: str, photos_needed: int):
                     f"{name}  |  {saved}/{photos_needed} saved  |  {rejected} rejected",
                     (20, h_frame - 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, COL_WHITE, 2)
-        cv2.putText(display, "Detector: RetinaFace + norm_crop alignment",
+        cv2.putText(display, "Detector: SCRFD + norm_crop alignment",
                     (20, h_frame - 45),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, (160, 160, 160), 1)
 
@@ -224,7 +226,7 @@ def collect(name: str, photos_needed: int):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Collect aligned face photos using RetinaFace + norm_crop."
+        description="Collect aligned face photos using SCRFD detector + norm_crop."
     )
     parser.add_argument("--name",   required=True,
                         help="Person's name (no spaces recommended, e.g. Jennifer)")

@@ -1,0 +1,11 @@
+dataset/
+embeddings/
+.env
+__pycache__/
+*.pyc
+venv/
+.venv/
+.vscode/
+*.json
+demo_db.json
+attendance.csv
