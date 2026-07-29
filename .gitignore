@@ -9,3 +9,7 @@ venv/
 *.json
 demo_db.json
 attendance.csv
+__pycache__/
+*.pyc
+.env
+*.onnx
