@@ -39,7 +39,7 @@ matplotlib.use("Agg")   # non-interactive; safe on any system
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 
-PROJECT_ROOT   = r"D:\Projects\cafe_facerec"
+PROJECT_ROOT   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EMBEDDINGS_DIR = os.path.join(PROJECT_ROOT, "embeddings")
 RESULTS_DIR    = os.path.join(PROJECT_ROOT, "results")
 sys.path.insert(0, PROJECT_ROOT)
