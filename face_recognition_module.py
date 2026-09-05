@@ -210,7 +210,7 @@ class FaceRecognitionModule:
                     "status": "no_face", "customer_id": None,
                     "score": 0.0, "bbox": None, "latency_ms": round((time.perf_counter() - t0)*1000, 1)
                 }
-            aligned = cv2.resize(crop, (112, 112))
+            aligned = align_face_5pts(frame, self._cached_bbox)
             face = FaceObject(bbox=self._cached_bbox)
 
         t_det = time.perf_counter()
@@ -234,6 +234,7 @@ class FaceRecognitionModule:
             "customer_id": customer_id,
             "score":       round(float(score), 4),
             "bbox":        face.bbox.tolist() if face else None,
+            "embedding":   probe.tolist() if probe is not None else None,
             "latency_ms":  round(total_ms, 1),
         }
 

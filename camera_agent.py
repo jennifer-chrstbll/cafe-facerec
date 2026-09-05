@@ -1,4 +1,4 @@
-﻿"""
+"""
 camera_agent.py -- 100% True AI POV Stream Sync + 10x Fast MobileFaceNet
 -------------------------------------------------------------------------
 - Stream is directly synchronized 1:1 with AI processing (True AI POV)
@@ -117,6 +117,19 @@ class StreamingHandler(BaseHTTPRequestHandler):
                     self.wfile.write(frame)
                     self.wfile.write(b'\r\n')
                 time.sleep(0.04)
+        elif self.path == '/latest-embedding':
+            with frame_lock:
+                emb = latest_embedding
+            if emb is not None:
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"embedding": emb}).encode('utf-8'))
+            else:
+                self.send_response(404)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"detail": "Belum ada wajah terdeteksi di kamera"}).encode('utf-8'))
         else:
             self.send_error(404)
             self.end_headers()
@@ -212,11 +225,17 @@ def main():
             score       = result["score"]
             lat_ms      = result.get("latency_ms", 0.0)
             bbox        = result.get("bbox", None)
+            embedding   = result.get("embedding", None)
             recognized  = (status == "known")
+
+            if embedding is not None:
+                with frame_lock:
+                    latest_embedding = embedding
 
             if status != "no_face":
                 log_key = customer_id if customer_id else "unknown"
-                if now - last_log_time.get(log_key, 0) >= COOLDOWN_SECONDS:
+                cd = COOLDOWN_SECONDS if recognized else 3
+                if now - last_log_time.get(log_key, 0) >= cd:
                     last_log_time[log_key] = now
                     try:
                         log_recognition(conn, customer_id, score, recognized)
