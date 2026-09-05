@@ -1,0 +1,9 @@
+{
+  "device_target": "Arduino Uno Q / Edge Cashier Terminal",
+  "scrfd_detection_avg_ms": 15.2,
+  "arcface_embedding_avg_ms": 24.52,
+  "faiss_index_search_avg_ms": 0.01,
+  "total_cashier_facerec_latency_ms": 39.73,
+  "throughput_faces_per_sec": 25.2,
+  "overall_status": "PASS"
+}

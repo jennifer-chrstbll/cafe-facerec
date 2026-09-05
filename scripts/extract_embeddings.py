@@ -1,4 +1,4 @@
-"""
+﻿"""
 extract_embeddings.py
 ---------------------
 Reads every photo in dataset/<person>/ folders,
@@ -21,7 +21,7 @@ The other models are retained for evaluate.py benchmark (Bab IV).
 
 Usage:
     python scripts/extract_embeddings.py                   (all 5 models)
-    python scripts/extract_embeddings.py --model arcface   (ArcFace only — fastest)
+    python scripts/extract_embeddings.py --model arcface   (ArcFace only â€” fastest)
 """
 
 import os
@@ -33,14 +33,14 @@ import numpy as np
 import cv2
 from tqdm import tqdm
 
-# ── Make sure models.py in project root is importable ─────────────────────────
-PROJECT_ROOT = r"D:\Projects\cafe_facerec"
+# â”€â”€ Make sure models.py in project root is importable â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # portable: works on Windows, Linux, and Raspberry Pi
 sys.path.insert(0, PROJECT_ROOT)
 
 DATASET_DIR    = os.path.join(PROJECT_ROOT, "dataset")
 EMBEDDINGS_DIR = os.path.join(PROJECT_ROOT, "embeddings")
 
-# ──────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def get_person_images(person_name: str):
     """Return list of BGR images for a person."""
@@ -147,7 +147,7 @@ def main(target_model: str = None):
                   f"failed={info['failed']}  avg_latency={info['avg_ms']:.1f}ms")
 
     print(f"\n\n{'='*60}")
-    print("  EXTRACTION COMPLETE — SUMMARY")
+    print("  EXTRACTION COMPLETE â€” SUMMARY")
     print(f"{'='*60}")
     print(f"  {'Model':<15} {'Total saved':>12} {'Avg latency (ms)':>18}")
     print(f"  {'-'*15} {'-'*12} {'-'*18}")

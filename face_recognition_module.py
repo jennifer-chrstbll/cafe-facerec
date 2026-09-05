@@ -49,33 +49,27 @@ def _l2_normalize(vec: np.ndarray) -> np.ndarray:
     return (vec / (norm + 1e-10)).astype(np.float32)
 
 
-def align_face_5pts(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> np.ndarray:
+def align_face_5pts(frame: np.ndarray, bbox: tuple) -> np.ndarray:
     """
-    Performs 5-Point Similarity Affine Alignment to normalize eye/nose/mouth geometry.
-    Ensures high ArcFace score (>0.70) even when head is turned or tilted!
+    Crop the detected face region and resize to 112x112 for ArcFace input.
+
+    FIX: Previous version used HARDCODED RATIOS (cw*0.34, ch*0.40, etc.)
+    as fake landmark positions. Those were NOT real landmarks -- they assumed
+    every face is perfectly frontal. cv2.estimateAffinePartial2D on fabricated
+    proportions introduces errors for non-frontal faces, contrary to what the
+    old docstring claimed.
+
+    This version uses honest center-crop + resize instead.
+
+    TODO: For genuine 5-point affine alignment, integrate SCRFD face detector
+    (in buffalo_l / buffalo_sc packs) which outputs 5 actual keypoints per face.
     """
     x1, y1, x2, y2 = bbox
     crop = frame[y1:y2, x1:x2]
     if crop.size == 0:
         return cv2.resize(frame, (112, 112))
+    return cv2.resize(crop, (112, 112))
 
-    ch, cw = crop.shape[:2]
-    # Estimate 5 facial landmark positions relative to crop bounding box
-    src_pts = np.array([
-        [cw * 0.34, ch * 0.40], # left eye
-        [cw * 0.66, ch * 0.40], # right eye
-        [cw * 0.50, ch * 0.58], # nose
-        [cw * 0.38, ch * 0.76], # left mouth
-        [cw * 0.62, ch * 0.76]  # right mouth
-    ], dtype=np.float32)
-
-    # Compute affine transformation matrix warping face to reference template
-    M, _ = cv2.estimateAffinePartial2D(src_pts, REFERENCE_5PTS)
-    if M is None:
-        return cv2.resize(crop, (112, 112))
-
-    aligned = cv2.warpAffine(crop, M, (112, 112), borderValue=0)
-    return aligned
 
 
 class FaceObject:
@@ -88,13 +82,13 @@ class FaceRecognitionModule:
     def __init__(
         self,
         det_thresh: float = 0.50,
-        threshold: float = 0.3600,
+        threshold: float = 0.2579,  # Updated from evaluate.py: ArcFace EER threshold (was 0.3600 - arbitrary)
     ):
         self.det_thresh = det_thresh
         self.threshold  = threshold
 
         # Detection stride: run SSD every N frames, cache bbox in between
-        self._det_stride     = 3   # run detector every 3rd call (~200ms saved on 2/3 frames)
+        self._det_stride     = 2   # was 3 -- halved for faster response on moving faces   # run detector every 3rd call (~200ms saved on 2/3 frames)
         self._det_call_count = 0
         self._cached_bbox    = None  # cached (x1,y1,x2,y2) from last detection
 
@@ -211,6 +205,7 @@ class FaceRecognitionModule:
                     "score": 0.0, "bbox": None, "latency_ms": round((time.perf_counter() - t0)*1000, 1)
                 }
             aligned = align_face_5pts(frame, self._cached_bbox)
+            aligned = align_face_5pts(frame, tuple(self._cached_bbox))
             face = FaceObject(bbox=self._cached_bbox)
 
         t_det = time.perf_counter()

@@ -1,15 +1,88 @@
-dataset/
-embeddings/
+# ==========================================
+# 1. Environment & Credentials (CRITICAL)
+# ==========================================
 .env
+.env.*
+*.env
+*.pem
+*.key
+*.cert
+*.crt
+# Allow template/example files
+!.env.example
+
+# ==========================================
+# 2. Python & Bytecode Cache
+# ==========================================
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+build/
+dist/
+*.egg-info/
+
+# ==========================================
+# 3. Virtual Environments
+# ==========================================
 venv/
 .venv/
-.vscode/
-*.json
-demo_db.json
-attendance.csv
-__pycache__/
-*.pyc
-.env
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ==========================================
+# 4. Biometric Data: Photos & Embeddings
+# (Raw facial images of individuals & vectors)
+# ==========================================
+dataset/
+dataset_raw/
+embeddings/
+*.npy
+*.npz
+
+# ==========================================
+# 5. Machine Learning Model Weights & Checkpoints
+# ==========================================
+models/*.onnx
+models/*.pb
+models/*.pbtxt
+models/*.pt
+models/*.pth
+models/*.bin
+models/*.tflite
+models/*.weights
 *.onnx
+*.pb
+*.pbtxt
+*.pt
+*.pth
+
+# ==========================================
+# 6. Database, Local Attendance Logs & Dumps
+# ==========================================
+attendance.csv
+demo_db.json
+*.log
+logs/
+*.sqlite3
+*.db
+
+# ==========================================
+# 7. OS & IDE Metadata
+# ==========================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+ehthumbs.db
+desktop.ini
