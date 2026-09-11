@@ -1,10 +1,11 @@
 """
 face_recognition_module.py
 --------------------------
-Production Face Recognition Pipeline for Arduino Uno Q:
-- 5-Point Affine Landmark Alignment (High accuracy even when head is turned/tilted)
-- InsightFace MobileFaceNet w600k_mbf.onnx (10x faster: ~120ms latency, >0.70 score accuracy)
-- 100% AI POV Sync
+Production Face Recognition Pipeline for Arduino Uno Q / Register Camera:
+- Genuine 5-Point Affine Landmark Alignment (SCRFD det_500m.onnx keypoints)
+- InsightFace MobileFaceNet w600k_mbf.onnx (512-d embeddings, ArcFace loss)
+- FAISS IndexFlatIP cosine similarity matching
+- 100% Real models: SCRFD + MobileFaceNet
 """
 
 from __future__ import annotations
@@ -27,6 +28,9 @@ logging.basicConfig(
 
 _HERE = Path(__file__).resolve().parent
 PROJECT_ROOT = _HERE
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from face_models import SCRFDFaceDetector, MobileFaceNetModel, align_face_5pts, l2_normalize
 
 try:
     import faiss
@@ -34,79 +38,40 @@ try:
 except ImportError:
     _USE_FAISS = False
 
-# Standard 112x112 ArcFace 5-Landmark reference template
-REFERENCE_5PTS = np.array([
-    [38.2946, 51.6963],  # left eye
-    [73.5318, 51.5014],  # right eye
-    [56.0252, 71.7366],  # nose tip
-    [41.5493, 92.3655],  # left mouth corner
-    [70.7299, 92.2041]   # right mouth corner
-], dtype=np.float32)
-
-
-def _l2_normalize(vec: np.ndarray) -> np.ndarray:
-    norm = np.linalg.norm(vec)
-    return (vec / (norm + 1e-10)).astype(np.float32)
-
-
-def align_face_5pts(frame: np.ndarray, bbox: tuple) -> np.ndarray:
-    """
-    Crop the detected face region and resize to 112x112 for ArcFace input.
-
-    FIX: Previous version used HARDCODED RATIOS (cw*0.34, ch*0.40, etc.)
-    as fake landmark positions. Those were NOT real landmarks -- they assumed
-    every face is perfectly frontal. cv2.estimateAffinePartial2D on fabricated
-    proportions introduces errors for non-frontal faces, contrary to what the
-    old docstring claimed.
-
-    This version uses honest center-crop + resize instead.
-
-    TODO: For genuine 5-point affine alignment, integrate SCRFD face detector
-    (in buffalo_l / buffalo_sc packs) which outputs 5 actual keypoints per face.
-    """
-    x1, y1, x2, y2 = bbox
-    crop = frame[y1:y2, x1:x2]
-    if crop.size == 0:
-        return cv2.resize(frame, (112, 112))
-    return cv2.resize(crop, (112, 112))
-
-
 
 class FaceObject:
-    def __init__(self, bbox, det_score=0.9):
+    def __init__(self, bbox, det_score=0.9, kps=None):
         self.bbox = np.array(bbox, dtype=np.int32)
-        self.det_score = det_score
+        self.det_score = float(det_score)
+        self.kps = np.array(kps, dtype=np.float32) if kps is not None else None
 
 
 class FaceRecognitionModule:
+    """
+    Production Face Recognition using SCRFD-0.5G (detector) + MobileFaceNet (embedding).
+    Features genuine 5-point affine landmark alignment and FAISS cosine matching.
+    """
     def __init__(
         self,
-        det_thresh: float = 0.50,
-        threshold: float = 0.2579,  # Updated from evaluate.py: ArcFace EER threshold (was 0.3600 - arbitrary)
+        det_thresh: float = 0.45,
+        threshold: float = 0.2579,
     ):
         self.det_thresh = det_thresh
         self.threshold  = threshold
 
-        # Detection stride: run SSD every N frames, cache bbox in between
-        self._det_stride     = 2   # was 3 -- halved for faster response on moving faces   # run detector every 3rd call (~200ms saved on 2/3 frames)
+        # Detection stride: run SCRFD every N frames, cache bbox & landmarks in between
+        self._det_stride     = 2
         self._det_call_count = 0
-        self._cached_bbox    = None  # cached (x1,y1,x2,y2) from last detection
+        self._cached_bbox    = None
+        self._cached_kps     = None
 
-        sys.path.insert(0, str(PROJECT_ROOT))
-        from models import _DirectArcFaceONNX, _download_pack, _download_ssd_detector, _find_onnx
+        logger.info("[Detector] Initializing SCRFD Face Detector (det_500m.onnx)...")
+        self._detector = SCRFDFaceDetector(conf_thresh=det_thresh)
+        logger.info("[Detector] SCRFD Face Detector ready.")
 
-        # Load OpenCV ResNet-SSD Face Detector
-        logger.info("[Detector] Loading OpenCV DNN SSD Face Detector...")
-        pb_path, pbtxt_path = _download_ssd_detector()
-        self._det_net = cv2.dnn.readNetFromTensorflow(pb_path, pbtxt_path)
-        logger.info("[Detector] OpenCV DNN SSD Face Detector ready.")
-
-        # Load MobileFaceNet (4MB, 10x faster, >0.70 score accuracy)
-        logger.info("[ArcFace] Loading MobileFaceNet (w600k_mbf.onnx)...")
-        _download_pack("buffalo_sc")
-        _mbf_path = _find_onnx("buffalo_sc", "w600k_mbf.onnx")
-        self._recognizer = _DirectArcFaceONNX(_mbf_path)
-        logger.info("[ArcFace] MobileFaceNet 10x Fast Recognizer ready.")
+        logger.info("[Recognizer] Initializing MobileFaceNet (w600k_mbf.onnx)...")
+        self._recognizer = MobileFaceNetModel()
+        logger.info("[Recognizer] MobileFaceNet ready.")
 
         self._labels: list[str] = []
         self._gallery: Optional[np.ndarray] = None
@@ -117,7 +82,7 @@ class FaceRecognitionModule:
         vecs: list[np.ndarray] = []
         for customer_id, vec in rows:
             labels.append(customer_id)
-            vecs.append(_l2_normalize(np.array(vec, dtype=np.float32)))
+            vecs.append(l2_normalize(np.array(vec, dtype=np.float32)))
         self._labels  = labels
         self._gallery = np.stack(vecs).astype(np.float32) if vecs else np.zeros((0, 512), dtype=np.float32)
         self._build_index()
@@ -141,111 +106,101 @@ class FaceRecognitionModule:
 
     def _detect_and_align_face(self, frame: np.ndarray):
         h, w = frame.shape[:2]
-        blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300), [104, 117, 123], False, False)
-        self._det_net.setInput(blob)
-        
-        try:
-            detections = self._det_net.forward()
-        except Exception:
+        dets, kpss = self._detector.detect(frame)
+
+        if len(dets) == 0:
             return None, None
 
-        if detections is None or len(detections) == 0:
-            return None, None
-
-        best_face = None
+        # Select highest-confidence face with minimum dimension
+        best_idx = None
         max_score = 0.0
+        for i, d in enumerate(dets):
+            conf = float(d[4])
+            bw = d[2] - d[0]
+            bh = d[3] - d[1]
+            if conf > self.det_thresh and conf > max_score and bw > 25 and bh > 25:
+                max_score = conf
+                best_idx = i
 
-        for i in range(detections.shape[2]):
-            confidence = float(detections[0, 0, i, 2])
-            if confidence > self.det_thresh and confidence > max_score:
-                box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
-                bx1, by1, bx2, by2 = box.astype("int")
-                bw, bh = bx2 - bx1, by2 - by1
-
-                if bw > 30 and bh > 30:
-                    max_score = confidence
-                    best_face = (max(0, bx1), max(0, by1), min(w, bx2), min(h, by2))
-
-        if best_face is None:
+        if best_idx is None:
             return None, None
 
-        # Apply 5-Point Affine Landmark Alignment
-        aligned_112 = align_face_5pts(frame, best_face)
-        return aligned_112, FaceObject(bbox=list(best_face), det_score=float(max_score))
+        bx1, by1, bx2, by2 = dets[best_idx][:4].astype(int)
+        best_bbox = (max(0, bx1), max(0, by1), min(w, bx2), min(h, by2))
+        best_kps = kpss[best_idx]
+
+        # Apply genuine 5-point affine landmark alignment to ArcFace template
+        aligned_112 = align_face_5pts(frame, best_kps)
+        return aligned_112, FaceObject(bbox=list(best_bbox), det_score=float(max_score), kps=best_kps)
 
     def recognize_face(self, frame: np.ndarray) -> dict:
         t0 = time.perf_counter()
         h, w = frame.shape[:2]
 
-        # Detection stride: run SSD every N frames, cache bbox in between
         self._det_call_count += 1
         if self._det_call_count % self._det_stride == 0 or self._cached_bbox is None:
-            # Full SSD detection pass
             aligned, face = self._detect_and_align_face(frame)
             if aligned is None:
                 self._cached_bbox = None
+                self._cached_kps  = None
                 return {
                     "status": "no_face", "customer_id": None,
                     "score": 0.0, "bbox": None, "latency_ms": round((time.perf_counter() - t0)*1000, 1)
                 }
             self._cached_bbox = face.bbox.tolist()
+            self._cached_kps  = face.kps
         else:
-            # Reuse cached bbox from last detection — skip 200ms SSD call
             if self._cached_bbox is None:
                 return {
                     "status": "no_face", "customer_id": None,
                     "score": 0.0, "bbox": None, "latency_ms": round((time.perf_counter() - t0)*1000, 1)
                 }
-            x1, y1, x2, y2 = self._cached_bbox
-            crop = frame[max(0,y1):min(h,y2), max(0,x1):min(w,x2)]
-            if crop.size == 0:
-                self._cached_bbox = None
-                return {
-                    "status": "no_face", "customer_id": None,
-                    "score": 0.0, "bbox": None, "latency_ms": round((time.perf_counter() - t0)*1000, 1)
-                }
-            aligned = align_face_5pts(frame, self._cached_bbox)
-            aligned = align_face_5pts(frame, tuple(self._cached_bbox))
-            face = FaceObject(bbox=self._cached_bbox)
+            if self._cached_kps is not None:
+                aligned = align_face_5pts(frame, self._cached_kps)
+            else:
+                x1, y1, x2, y2 = self._cached_bbox
+                crop = frame[max(0,y1):min(h,y2), max(0,x1):min(w,x2)]
+                aligned = cv2.resize(crop, (112, 112)) if crop.size > 0 else np.zeros((112, 112, 3), dtype=np.uint8)
+            face = FaceObject(bbox=self._cached_bbox, kps=self._cached_kps)
 
-        t_det = time.perf_counter()
         try:
-            probe = self._recognizer.get_feat(aligned).flatten()
-            probe = _l2_normalize(probe)
+            probe = self._recognizer.get_embedding(aligned)
         except Exception as e:
             return {
                 "status": "no_face", "customer_id": None,
                 "score": 0.0, "bbox": None, "latency_ms": round((time.perf_counter() - t0)*1000, 1)
             }
 
-        t_emb = time.perf_counter()
-        customer_id, score = self._search(probe)
-        t_search = time.perf_counter()
-
-        total_ms = (t_search - t0) * 1000
-
-        return {
-            "status":      "known" if customer_id else "unknown",
-            "customer_id": customer_id,
-            "score":       round(float(score), 4),
-            "bbox":        face.bbox.tolist() if face else None,
-            "embedding":   probe.tolist() if probe is not None else None,
-            "latency_ms":  round(total_ms, 1),
-        }
-
-    def _search(self, probe: np.ndarray) -> tuple[str | None, float]:
-        if not self._labels or self._gallery is None or len(self._gallery) == 0:
-            return None, 0.0
+        # Match against gallery
+        if self._gallery is None or len(self._gallery) == 0:
+            return {
+                "status": "unregistered",
+                "customer_id": None,
+                "score": 0.0,
+                "bbox": face.bbox.tolist(),
+                "embedding": probe.tolist(),
+                "latency_ms": round((time.perf_counter() - t0)*1000, 1)
+            }
 
         if _USE_FAISS and self._index is not None:
-            D, I = self._index.search(probe.reshape(1, -1), k=1)
-            score = float(D[0][0])
-            idx   = int(I[0][0])
+            D, I = self._index.search(probe.reshape(1, -1), 1)
+            best_score = float(D[0][0])
+            best_idx   = int(I[0][0])
+            best_label = self._labels[best_idx]
         else:
-            sims  = self._gallery @ probe
-            idx   = int(np.argmax(sims))
-            score = float(sims[idx])
+            sims = np.dot(self._gallery, probe)
+            best_idx   = int(np.argmax(sims))
+            best_score = float(sims[best_idx])
+            best_label = self._labels[best_idx]
 
-        if score >= self.threshold:
-            return self._labels[idx], score
-        return None, score
+        status = "recognized" if best_score >= self.threshold else "unregistered"
+        customer_id = best_label if status == "recognized" else None
+
+        return {
+            "status": status,
+            "customer_id": customer_id,
+            "score": round(best_score, 4),
+            "bbox": face.bbox.tolist(),
+            "embedding": probe.tolist(),
+            "latency_ms": round((time.perf_counter() - t0)*1000, 1)
+        }
