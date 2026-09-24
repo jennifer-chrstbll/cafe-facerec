@@ -39,7 +39,9 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL not set in .env")
 
 latest_jpeg_frame = None
+latest_embedding  = None        # 512-d list; read by /latest-embedding endpoint
 frame_lock = threading.Lock()
+
 
 
 def _parse_vector(v) -> list:
@@ -158,7 +160,7 @@ def open_camera():
 
 
 def main():
-    global latest_jpeg_frame
+    global latest_jpeg_frame, latest_embedding
 
     print("\n" + "=" * 55)
     print("  Cafe FaceRec -- True AI POV Sync & Fast MobileFaceNet")
@@ -246,7 +248,17 @@ def main():
                         else:
                             print(f"  [{ts}] ❓ UNKNOWN  score={score:.3f} | AI Latency: {lat_ms:.0f}ms | FPS: {current_fps:.1f}")
                     except Exception as e:
-                        print(f"  [DB Error] {e}")
+                        # Auto-reconnect on dropped DB connection (WiFi blip etc.)
+                        print(f"  [DB Error] {e} — attempting reconnect...")
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        try:
+                            conn = connect_db()
+                            print("  [DB] Reconnected to Supabase.")
+                        except Exception as re:
+                            print(f"  [DB] Reconnect failed: {re}")
 
             # Draw 1:1 In-Sync AI POV Bounding Box & HUD
             display_frame = frame.copy()

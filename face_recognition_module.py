@@ -174,7 +174,7 @@ class FaceRecognitionModule:
         # Match against gallery
         if self._gallery is None or len(self._gallery) == 0:
             return {
-                "status": "unregistered",
+                "status": "unknown",
                 "customer_id": None,
                 "score": 0.0,
                 "bbox": face.bbox.tolist(),
@@ -193,8 +193,8 @@ class FaceRecognitionModule:
             best_score = float(sims[best_idx])
             best_label = self._labels[best_idx]
 
-        status = "recognized" if best_score >= self.threshold else "unregistered"
-        customer_id = best_label if status == "recognized" else None
+        status = "known" if best_score >= self.threshold else "unknown"
+        customer_id = best_label if status == "known" else None
 
         return {
             "status": status,
@@ -204,3 +204,85 @@ class FaceRecognitionModule:
             "embedding": probe.tolist(),
             "latency_ms": round((time.perf_counter() - t0)*1000, 1)
         }
+
+    def extract_embedding_from_frame(self, frame: np.ndarray) -> dict:
+        """
+        Extract a 512-d ArcFace embedding from a frame WITHOUT searching the gallery.
+        Used by the /extract-embedding endpoint and the CRM enrollment flow.
+
+        Returns
+        -------
+        dict:
+            success   : bool
+            embedding : list[float] (512-d, L2-normalized) or None
+            det_score : float or None
+            message   : str
+        """
+        aligned, face = self._detect_and_align_face(frame)
+        if aligned is None:
+            return {
+                "success":   False,
+                "embedding": None,
+                "det_score": None,
+                "message":   "No face detected in the frame.",
+            }
+        try:
+            emb = self._recognizer.get_embedding(aligned)
+            return {
+                "success":   True,
+                "embedding": emb.tolist(),
+                "det_score": round(float(face.det_score), 4),
+                "message":   "OK",
+            }
+        except Exception as e:
+            logger.error(f"[extract_embedding_from_frame] Embedding failed: {e}")
+            return {
+                "success":   False,
+                "embedding": None,
+                "det_score": round(float(face.det_score), 4) if face else None,
+                "message":   str(e),
+            }
+
+    def annotate_frame(self, frame: np.ndarray, result: dict) -> np.ndarray:
+        """
+        Draw a recognition overlay (bounding box + label) on the given frame.
+        Uses the cached bbox from the most recent detection so it does NOT
+        re-run SCRFD inference — safe to call on every display frame.
+
+        Parameters
+        ----------
+        frame  : BGR image from the camera.
+        result : dict returned by recognize_face().
+
+        Returns
+        -------
+        A new BGR image with the overlay drawn.
+        """
+        out    = frame.copy()
+        status = result.get("status", "no_face")
+        score  = result.get("score", 0.0)
+        cid    = result.get("customer_id") or ""
+        bbox   = result.get("bbox")
+
+        if status == "no_face" or bbox is None:
+            return out
+
+        x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+
+        if status == "known":
+            color = (70, 210, 90)       # green
+            label = f"{cid[:8]}  {score:.2f}"
+        else:  # "unknown"
+            color = (30, 190, 255)      # amber
+            label = f"Unknown  {score:.2f}"
+
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+        # Filled label background so text is always readable
+        cv2.rectangle(out, (x1, max(0, y1 - th - 10)), (x1 + tw + 8, y1), color, -1)
+        cv2.putText(
+            out, label,
+            (x1 + 4, max(th, y1 - 5)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 1, cv2.LINE_AA,
+        )
+        return out
