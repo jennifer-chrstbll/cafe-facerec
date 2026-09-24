@@ -224,6 +224,7 @@ class FaceRecognitionModule:
                 "success":   False,
                 "embedding": None,
                 "det_score": None,
+                "bbox":      None,
                 "message":   "No face detected in the frame.",
             }
         try:
@@ -232,6 +233,7 @@ class FaceRecognitionModule:
                 "success":   True,
                 "embedding": emb.tolist(),
                 "det_score": round(float(face.det_score), 4),
+                "bbox":      face.bbox.tolist(),
                 "message":   "OK",
             }
         except Exception as e:
@@ -240,6 +242,7 @@ class FaceRecognitionModule:
                 "success":   False,
                 "embedding": None,
                 "det_score": round(float(face.det_score), 4) if face else None,
+                "bbox":      face.bbox.tolist() if face else None,
                 "message":   str(e),
             }
 

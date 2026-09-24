@@ -143,7 +143,9 @@ def camera_loop():
     camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     frame_count = 0
-    last_result_local = {"status": "no_face", "customer_id": None, "score": 0.0, "det_score": None}
+    # last_result_local drives the MJPEG overlay — starts as no_face.
+    # Keys mirror what annotate_frame() expects: status/customer_id/score/bbox.
+    last_result_local = {"status": "no_face", "customer_id": None, "score": 0.0, "bbox": None}
 
     logger.info("[Camera] Loop started.")
 
@@ -155,24 +157,42 @@ def camera_loop():
 
         frame_count += 1
 
-        # ── Recognition every N frames ────────────────────────────────────────
+        # ── Extract embedding + forward to CRM every N frames ─────────────────
         if frame_count % RECOG_INTERVAL == 0:
-            result = face_module.recognize_face(frame)
-            last_result_local = result
+            emb_result = face_module.extract_embedding_from_frame(frame)
 
-            if result["status"] != "no_face":
-                emb_result = face_module.extract_embedding_from_frame(frame)
-                if emb_result["success"]:
-                    with _camera_lock:
-                        latest_embedding = emb_result["embedding"]
-                        latest_result    = result
-                        last_face_time   = time.time()
+            if emb_result["success"]:
+                embedding = emb_result["embedding"]
 
-                    # Forward to CRM (non-blocking path — failure is logged, not fatal)
-                    _forward_to_crm(emb_result["embedding"])
-            else:
                 with _camera_lock:
-                    latest_result = result
+                    latest_embedding = embedding
+                    last_face_time   = time.time()
+
+                # Send embedding to CRM — CRM holds the FAISS gallery and
+                # handles matching, visit logging, and recommendation logic.
+                crm_response = _forward_to_crm(embedding)
+
+                if crm_response:
+                    recognized    = crm_response.get("recognized", False)
+                    customer_name = crm_response.get("customer_name", "Unknown")
+                    score         = float(crm_response.get("score") or 0.0)
+
+                    # Build a result dict compatible with annotate_frame()
+                    last_result_local = {
+                        "status":      "known" if recognized else "unknown",
+                        "customer_id": customer_name,   # display name from CRM for overlay
+                        "score":       score,
+                        "bbox":        emb_result.get("bbox"),
+                    }
+
+                    with _camera_lock:
+                        latest_result = last_result_local
+
+            else:
+                # No face detected this interval — clear overlay
+                last_result_local = {"status": "no_face", "customer_id": None, "score": 0.0, "bbox": None}
+                with _camera_lock:
+                    latest_result = last_result_local
 
         # ── Annotate frame ────────────────────────────────────────────────────
         annotated = face_module.annotate_frame(frame, last_result_local)
@@ -197,6 +217,7 @@ def startup_event():
     t = threading.Thread(target=camera_loop, daemon=True)
     t.start()
     logger.info(f"[Server] Camera thread started. CRM target: {CRM_API_URL}")
+
 
 
 @app.on_event("shutdown")
