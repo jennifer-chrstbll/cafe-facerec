@@ -120,7 +120,13 @@ class Config:
     # Logging to Supabase
     known_log_cooldown: float = _env("KNOWN_LOG_COOLDOWN", 60.0, float)
     unknown_log_cooldown: float = _env("UNKNOWN_LOG_COOLDOWN", 10.0, float)
-    visit_cooldown_min: int = _env("VISIT_COOLDOWN_MIN", 30, int)   # same as CRM VisitService
+    visit_cooldown_min: int = _env("VISIT_COOLDOWN_MIN", 30, int)   # re-entry within N min = same visit
+    visit_max_open_hours: int = _env("VISIT_MAX_OPEN_HOURS", 6, int)  # same as CRM settings.visits
+    heartbeat_sec: float = _env("HEARTBEAT_SEC", 30.0, float)
+
+    # CRM (identity association): https://<your-crm>.vercel.app + shared DEVICE_API_KEY
+    crm_url: str = _env("CRM_URL", "")
+    device_api_key: str = _env("DEVICE_API_KEY", "")
     reload_interval: float = _env("RELOAD_INTERVAL", 120.0, float)
     gallery_since: str = _env("GALLERY_SINCE", "")              # e.g. 2026-09-12 to skip legacy embeddings
 
@@ -547,6 +553,11 @@ class Database(threading.Thread):
         self.online = False
         self.gallery_loaded = threading.Event()
         self._reload_at = 0.0
+        self._next_enroll_poll = 0.0
+        self._next_heartbeat = 0.0
+        self._optional_off: set = set()   # features whose table is missing (migration 004 not run)
+        self.enroll_fn = None             # () -> current enrollment template dict or None
+        self.status_fn = None             # () -> dict for device_status.info
 
     def submit(self, kind: str, **kw):
         try:
@@ -601,13 +612,81 @@ class Database(threading.Thread):
                             (kw["customer_id"], round(kw["score"], 6), MODEL_TAG,
                              self.cfg.camera_id, kw["customer_id"] is not None))
             elif kind == "visit":
-                # One visit per customer per VISIT_COOLDOWN_MIN, same rule as the CRM VisitService.
+                # Same rule as the CRM: open a visit only if the customer has no active one
+                # (open and < VISIT_MAX_OPEN_HOURS old) and did not leave in the last VISIT_COOLDOWN_MIN.
                 cur.execute("""INSERT INTO visits (customer_id, entry_time)
                                SELECT %s::uuid, NOW()
                                WHERE NOT EXISTS (
-                                   SELECT 1 FROM visits WHERE customer_id = %s::uuid
-                                   AND entry_time > NOW() - make_interval(mins => %s))""",
-                            (kw["customer_id"], kw["customer_id"], self.cfg.visit_cooldown_min))
+                                   SELECT 1 FROM visits WHERE customer_id = %s::uuid AND (
+                                       (exit_time IS NULL AND entry_time > NOW() - make_interval(hours => %s))
+                                       OR exit_time > NOW() - make_interval(mins => %s)))""",
+                            (kw["customer_id"], kw["customer_id"], self.cfg.visit_max_open_hours,
+                             self.cfg.visit_cooldown_min))
+
+    def _optional(self, name: str, fn):
+        """Run a feature that needs migration 004; switch it off (once) if its table is missing."""
+        if name in self._optional_off:
+            return
+        try:
+            fn()
+        except Exception as e:
+            if "does not exist" in str(e):
+                self._optional_off.add(name)
+                log.warning("[DB] %s disabled: %s (run cafe-crm/database/004_integration.sql)",
+                            name, str(e).splitlines()[0])
+            else:
+                raise
+
+    def _heartbeat(self):
+        info = self.status_fn() if self.status_fn else {}
+        info["gallery"] = self.gallery.stats()["n_customers"]
+        with self.conn.cursor() as cur:
+            cur.execute("""INSERT INTO device_status (device_id, kind, last_seen_at, info)
+                           VALUES (%s, 'facerec', NOW(), %s::jsonb)
+                           ON CONFLICT (device_id) DO UPDATE SET last_seen_at = NOW(), info = EXCLUDED.info""",
+                        (self.cfg.camera_id, json.dumps(info)))
+
+    def _poll_enrollment(self):
+        """Serve one PENDING enrollment request from the CRM with the face in front of the camera."""
+        with self.conn.cursor() as cur:
+            cur.execute("""SELECT request_id::text, customer_id::text, EXTRACT(EPOCH FROM created_at)
+                           FROM enrollment_requests
+                           WHERE camera_id = %s AND status = 'PENDING'
+                             AND created_at > NOW() - INTERVAL '30 seconds'
+                           ORDER BY created_at LIMIT 1""", (self.cfg.camera_id,))
+            row = cur.fetchone()
+            if not row:
+                return
+            request_id, customer_id, created = row[0], row[1], float(row[2])
+            e = self.enroll_fn() if self.enroll_fn else None
+            waited = time.time() - created
+
+            def finish(status: str, message: str, n: Optional[int] = None):
+                cur.execute("""UPDATE enrollment_requests SET status = %s, message = %s, n_frames = %s,
+                               completed_at = NOW() WHERE request_id = %s::uuid AND status = 'PENDING'""",
+                            (status, message, n, request_id))
+
+            # Template must come from a face seen AFTER the cashier pressed the button.
+            fresh = e is not None and e["time"] >= created and time.time() - e["time"] <= self.cfg.enroll_max_age
+            if fresh and e["state"] == "known" and e["customer_id"] != customer_id                     and not self.cfg.allow_duplicate_enroll:
+                return finish("FAILED", f"Wajah ini sudah terdaftar sebagai {e['name'] or 'pelanggan lain'}.")
+            if fresh and e["faces_in_view"] > 1:
+                if waited > 15:
+                    finish("FAILED", "Ada lebih dari satu wajah di depan kamera.")
+                return
+            if not fresh or e["n_frames"] < self.cfg.enroll_min_frames:
+                if waited > 15:
+                    finish("FAILED", "Wajah tidak terlihat jelas di kamera kasir.")
+                return
+            # Re-enrollment replaces the customer's old (possibly legacy-model) embeddings.
+            cur.execute("DELETE FROM embeddings WHERE customer_id = %s::uuid", (customer_id,))
+            cur.execute("""INSERT INTO embeddings (embedding_id, customer_id, embedding_vector, model_name,
+                                                   is_primary, created_at)
+                           VALUES (gen_random_uuid(), %s::uuid, %s, 'mobilefacenet', TRUE, NOW())""",
+                        (customer_id, json.dumps(e["embedding"])))
+            finish("DONE", "OK", e["n_frames"])
+            log.info("[Enroll] customer %s enrolled from %d frames", customer_id[:8], e["n_frames"])
+            self.request_reload()
 
     def run(self):
         backoff = 2.0
@@ -620,9 +699,15 @@ class Database(threading.Thread):
                 if time.time() >= self._reload_at:
                     self._load_gallery()
                     self._reload_at = time.time() + self.cfg.reload_interval
+                if time.time() >= self._next_enroll_poll:
+                    self._next_enroll_poll = time.time() + 1.5
+                    self._optional("enrollment", self._poll_enrollment)
+                if time.time() >= self._next_heartbeat:
+                    self._next_heartbeat = time.time() + self.cfg.heartbeat_sec
+                    self._optional("heartbeat", self._heartbeat)
                 if pending is None:
                     try:
-                        pending = self.jobs.get(timeout=1.0)
+                        pending = self.jobs.get(timeout=0.5)
                     except queue.Empty:
                         continue
                 self._execute(*pending)
@@ -638,6 +723,37 @@ class Database(threading.Thread):
                 self.conn = None
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
+
+
+class CrmClient(threading.Thread):
+    """Tells the CRM a customer was confirmed at the cashier, so it binds the person-tracking
+    Track ID standing at the counter to this Customer ID (POST /api/association/bind)."""
+
+    def __init__(self, cfg: Config):
+        super().__init__(daemon=True, name="crm")
+        self.cfg = cfg
+        self.jobs: queue.Queue = queue.Queue(maxsize=50)
+
+    def bind(self, customer_id: str, when: float):
+        try:
+            self.jobs.put_nowait({"customer_id": customer_id,
+                                  "face_timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(when))})
+        except queue.Full:
+            pass
+
+    def run(self):
+        url = self.cfg.crm_url.rstrip("/") + "/api/association/bind"
+        while True:
+            job = self.jobs.get()
+            req = urllib.request.Request(url, data=json.dumps(job).encode(), method="POST", headers={
+                "Content-Type": "application/json", "x-device-key": self.cfg.device_api_key})
+            try:
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    res = json.loads(r.read() or b"{}")
+                log.info("[Assoc] %s -> %s track=%s score=%s", job["customer_id"][:8], res.get("status"),
+                         res.get("track_id"), res.get("score"))
+            except Exception as e:
+                log.warning("[Assoc] CRM unreachable (%s); cashier can confirm manually", e)
 
 
 # ── Camera (always hands out the newest frame -> no buffer lag) ──────────────
@@ -703,10 +819,11 @@ class Camera(threading.Thread):
 # ── Shared state between the camera loop and the HTTP server ─────────────────
 
 class AppState:
-    def __init__(self, cfg: Config, engine: FaceEngine, db: Optional[Database]):
+    def __init__(self, cfg: Config, engine: FaceEngine, db: Optional[Database], crm: Optional["CrmClient"] = None):
         self.cfg = cfg
         self.engine = engine
         self.db = db
+        self.crm = crm
         self.lock = threading.Lock()
         self.jpeg: Optional[bytes] = None
         self.jpeg_seq = 0
@@ -895,6 +1012,8 @@ def handle_events(state: AppState, changed: list[Track], now: float, last_known:
             if state.db:
                 state.db.submit("log", customer_id=t.customer_id, score=t.score)
                 state.db.submit("visit", customer_id=t.customer_id)
+            if state.crm:
+                state.crm.bind(t.customer_id, now)
         else:
             if now - last_unknown[0] < state.cfg.unknown_log_cooldown:
                 continue
@@ -938,7 +1057,22 @@ def main():
         if not db.gallery_loaded.wait(timeout=20):
             log.warning("[Gallery] Not loaded yet (DB unreachable?) -- starting anyway, will retry.")
 
-    state = AppState(cfg, engine, db)
+    crm = None
+    if cfg.crm_url and cfg.device_api_key:
+        crm = CrmClient(cfg)
+        crm.start()
+    else:
+        log.info("[Assoc] CRM_URL / DEVICE_API_KEY not set: identity association left to the cashier")
+
+    state = AppState(cfg, engine, db, crm)
+    if db:
+        def enroll_snapshot():
+            with state.lock:
+                return dict(state.enroll) if state.enroll else None
+        db.enroll_fn = enroll_snapshot
+        db.status_fn = lambda: {"fps": round(state.fps, 1), "faces_in_view": state.faces_in_view,
+                                "threshold": cfg.match_threshold, "model": MODEL_TAG,
+                                "timing_ms": {k: round(v, 1) for k, v in engine.timing.items()}}
     camera = Camera(cfg)
     camera.start()
 

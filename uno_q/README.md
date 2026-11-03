@@ -45,6 +45,19 @@ sudo systemctl daemon-reload && sudo systemctl enable --now facerec
 journalctl -u facerec -f
 ```
 
+## How it talks to the rest of the system
+
+| What | How |
+|---|---|
+| Recognitions, visits | rows in Supabase `recognition_logs`, `visits` |
+| Face enrollment from the CRM | CRM inserts `enrollment_requests`; this agent polls it every 1.5 s, captures the face in front of the camera and writes `embeddings` itself (the cloud website cannot reach the board on the cafe LAN) |
+| Status light in the CRM | heartbeat row in `device_status` every 30 s (FPS, gallery size) |
+| Identity association | after each confirmed customer: `POST {CRM_URL}/api/association/bind` with header `x-device-key` |
+| Live video | `http://<uno-q-ip>:5001/video_feed`, only reachable on the cafe Wi-Fi |
+
+Requires `cafe-crm/database/004_integration.sql` to be applied; without it enrollment and
+heartbeat switch themselves off with a warning and recognition keeps working.
+
 ## Before the field test
 
 1. **Gallery check:** `venv/bin/python ../scripts/gallery_tool.py check` (copy `scripts/` too, or

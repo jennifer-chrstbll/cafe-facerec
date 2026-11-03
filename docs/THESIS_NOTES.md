@@ -207,13 +207,10 @@ device runs.
 2. **Re-enroll** every customer enrolled before 2026-09-12 (`gallery_tool.py check`). Those
    embeddings came from ResNet50 or from un-aligned crops and won't match.
 3. Deploy `uno_q/` to the board, measure `benchmark_edge.py` there, and put those numbers in Bab IV.
-4. CRM repo follow-ups (not changed here):
-   - enrollment writes `model_name="arcface"`; change it to `"mobilefacenet"`;
-   - the backend `FACEREC_THRESHOLD` default is 0.258; set it to 0.40;
-   - consent is set to `True` automatically. The proposal promises *written consent*, so add an
-     explicit consent step;
-   - show the 409 "already registered" message instead of "face not detected".
-5. `start_all.bat` still starts `api_server.py` (now in `legacy/`). For a PC demo, start
-   `python uno_q\facerec_uno_q.py` instead.
+4. CRM integration (done in `cafe-crm`): enrollment now goes through `enrollment_requests`
+   (the UNO Q writes `model_name = 'mobilefacenet'`), consent is an explicit required step,
+   duplicates are refused, and after each confirmed customer the UNO Q calls the CRM's
+   identity-association endpoint. Contract: `cafe-crm/docs/INTEGRATION.md`.
+5. Set `CRM_URL` and `DEVICE_API_KEY` in `uno_q/.env` (same key as in Vercel).
 6. Raw photos: the proposal says raw face images are deleted within 24 h of extraction. Keep
    `dataset/` for consenting participants' offline evaluation only, and delete it on schedule.
