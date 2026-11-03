@@ -1,535 +1,237 @@
 """
 evaluate.py
 -----------
-Evaluates all 5 models using embeddings already extracted by extract_embeddings.py.
+Offline evaluation of the deployed recognizer (MobileFaceNet w600k_mbf) on dataset/<person>/*.jpg.
+The photos are aligned 112x112 crops made by scripts/collect_dataset.py.
 
-Protocol: Leave-One-Out (LOO)
-    For each person, one embedding is the probe. The rest (from all people) form
-    the gallery. We ask: does the top-1 FAISS match return the correct person?
+What it measures (the face-recognition metrics in the proposal):
+  1. Verification (1:1, all pairs)        genuine/impostor scores, EER, ROC, TAR@FAR
+  2. Open-set identification (1:N)        exactly how the cashier camera works:
+       - each person is enrolled with an averaged template of N_ENROLL photos
+         (same as /latest-embedding), remaining photos are probes
+       - Rank-1  : top-1 gallery match is the right person (closed-set)
+       - FRR     : enrolled person NOT accepted as themself at threshold tau
+       - FAR     : person removed from the gallery (unknown) but accepted as someone
+                   (leave-one-person-out, so every person acts as an impostor once)
+  3. Track-level voting                   the same FAR/FRR after the 3-of-5 vote used on
+                                          the device (frames sampled from the person's probes;
+                                          an approximation, real video frames are correlated)
+  4. Recommended tau                      smallest tau with open-set FAR <= --target-far
 
-Metrics reported per model:
-    - Rank-1 Accuracy       : correct top-1 match rate
-    - TAR @ FAR=0.01        : True Accept Rate when False Accept Rate ≤ 1%
-    - TAR @ FAR=0.001       : stricter threshold
-    - EER                   : Equal Error Rate (where FAR == FRR)
-    - Avg inference latency : from extract_embeddings summary (ms)
-    - Threshold @ EER       : cosine similarity threshold to use in live demo
-
-Also generates thesis figures:
-    - ROC Curve  (TAR vs FAR for all models)
-    - CMC Curve  (Rank-1 through Rank-10)
-    - DET Curve  (log-scale FAR vs FRR)
-
-Usage:
+Usage
     python scripts/evaluate.py
-    python scripts/evaluate.py --model arcface
-    python scripts/evaluate.py --no-plots   (skip figure generation)
+    python scripts/evaluate.py --model models/w600k_mbf_int8.onnx   # evaluate the INT8 model
+    python scripts/evaluate.py --threshold 0.36 --enroll 3
 """
 
+from __future__ import annotations
+
+import argparse
+import json
 import os
 import sys
-import argparse
+from pathlib import Path
+
+import cv2
 import numpy as np
-from itertools import combinations
-from scipy.optimize import brentq
-from scipy.interpolate import interp1d
 
-import matplotlib
-matplotlib.use("Agg")   # non-interactive; safe on any system
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "uno_q"))
+import facerec_uno_q as fr  # noqa: E402
 
-PROJECT_ROOT   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EMBEDDINGS_DIR = os.path.join(PROJECT_ROOT, "embeddings")
-RESULTS_DIR    = os.path.join(PROJECT_ROOT, "results")
-sys.path.insert(0, PROJECT_ROOT)
-
-os.makedirs(RESULTS_DIR, exist_ok=True)
+DATASET = ROOT / "dataset"
+RESULTS = ROOT / "results"
 
 
-# ── Cosine similarity ─────────────────────────────────────────────────────────
-
-def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.dot(a, b))   # embeddings are already L2-normalised
-
-
-# ── Load embeddings for one model ─────────────────────────────────────────────
-
-def load_embeddings(model_key: str):
-    """
-    Returns:
-        labels : list of str  — person name per embedding
-        embs   : np.ndarray   — shape (N, D)
-    """
-    model_dir = os.path.join(EMBEDDINGS_DIR, model_key)
-    if not os.path.isdir(model_dir):
-        raise FileNotFoundError(f"No embeddings found for '{model_key}' at {model_dir}")
-
-    labels, embs = [], []
-    for fname in sorted(os.listdir(model_dir)):
-        if not fname.endswith(".npy"):
-            continue
-        person = fname[:-4]
-        arr    = np.load(os.path.join(model_dir, fname))   # (n_photos, D)
-        for emb in arr:
-            labels.append(person)
-            embs.append(emb)
-
-    return labels, np.stack(embs).astype(np.float32)
+def load_embeddings(model_path: str):
+    model = fr.MobileFaceNet(fr.find_model("w600k_mbf.onnx", model_path), os.cpu_count() or 4)
+    names, embs = [], []
+    for person in sorted(p for p in DATASET.iterdir() if p.is_dir()):
+        for img_path in sorted(person.glob("*.jpg")):
+            img = cv2.imread(str(img_path))
+            if img is None:
+                continue
+            if img.shape[:2] != (112, 112):
+                img = cv2.resize(img, (112, 112))
+            names.append(person.name)
+            embs.append(model.embed(img))
+    return np.array(names), np.stack(embs)
 
 
-# ── Build genuine / impostor score pairs ─────────────────────────────────────
-
-def build_score_pairs(labels, embs):
-    """
-    Genuine pairs  : same person, different photo
-    Impostor pairs : different people
-    Returns two lists of cosine similarity scores.
-    """
-    n          = len(labels)
-    genuine    = []
-    impostor   = []
-
-    for i in range(n):
-        for j in range(i + 1, n):
-            score = cosine_sim(embs[i], embs[j])
-            if labels[i] == labels[j]:
-                genuine.append(score)
-            else:
-                impostor.append(score)
-
-    return np.array(genuine), np.array(impostor)
+def verification(labels, X):
+    sims = X @ X.T
+    iu = np.triu_indices(len(X), 1)
+    same = (labels[:, None] == labels[None, :])[iu]
+    s = sims[iu]
+    return s[same], s[~same]
 
 
-# ── Rank-1 accuracy (Leave-One-Out) ──────────────────────────────────────────
-
-def rank1_loo(labels, embs):
-    """
-    For each embedding as probe, compare against all others (gallery).
-    Gallery includes all embeddings EXCEPT the probe itself.
-    """
-    n       = len(labels)
-    correct = 0
-
-    for i in range(n):
-        probe       = embs[i]
-        gallery_emb = np.concatenate([embs[:i], embs[i+1:]], axis=0)
-        gallery_lbl = labels[:i] + labels[i+1:]
-
-        sims       = gallery_emb @ probe           # (n-1,) cosine similarities
-        top1_idx   = int(np.argmax(sims))
-        if gallery_lbl[top1_idx] == labels[i]:
-            correct += 1
-
-    return correct / n
+def eer(genuine, impostor):
+    ts = np.linspace(-0.2, 1.0, 2401)
+    far = np.array([(impostor >= t).mean() for t in ts])
+    frr = np.array([(genuine < t).mean() for t in ts])
+    i = int(np.argmin(np.abs(far - frr)))
+    return float((far[i] + frr[i]) / 2), float(ts[i]), ts, far, frr
 
 
-def rankk_loo(labels: list, embs: np.ndarray, max_rank: int = 10) -> list:
-    """
-    Compute Rank-1 through Rank-max_rank accuracy (CMC curve).
-    Returns list of length max_rank: [rank1_acc, rank2_acc, ..., rankK_acc]
-    """
-    n       = len(labels)
-    correct = [0] * max_rank
-
-    for i in range(n):
-        probe       = embs[i]
-        gallery_emb = np.concatenate([embs[:i], embs[i+1:]], axis=0)
-        gallery_lbl = labels[:i] + labels[i+1:]
-
-        sims        = gallery_emb @ probe
-        sorted_idx  = np.argsort(sims)[::-1]       # descending
-
-        for k in range(max_rank):
-            top_k_labels = [gallery_lbl[j] for j in sorted_idx[:k+1]]
-            if labels[i] in top_k_labels:
-                correct[k] += 1
-
-    return [c / n for c in correct]
+def open_set_scores(labels, X, n_enroll, seed):
+    """Per probe: (true person, best id with own template, its score, best score with own template removed)."""
+    rng = np.random.default_rng(seed)
+    people = sorted(set(labels))
+    templates, probes = {}, []
+    for p in people:
+        idx = rng.permutation(np.where(labels == p)[0])
+        templates[p] = fr.l2_normalize(X[idx[:n_enroll]].mean(0))
+        probes += [(p, j) for j in idx[n_enroll:]]
+    T = np.stack([templates[p] for p in people])
+    out = []
+    for p, j in probes:
+        s = T @ X[j]
+        own = people.index(p)
+        best = int(np.argmax(s))
+        s_wo = s.copy()
+        s_wo[own] = -1
+        others = np.delete(s, own)
+        out.append((p, people[best], float(s[best]), float(s_wo.max()), others))
+    return out
 
 
-# ── TAR @ FAR, EER ───────────────────────────────────────────────────────────
-
-def compute_tar_at_far(genuine, impostor, target_far=0.01):
-    """Compute TAR when FAR is at or below target_far."""
-    thresholds = np.linspace(
-        min(genuine.min(), impostor.min()),
-        max(genuine.max(), impostor.max()),
-        10000
-    )
-    best_tar = 0.0
-    for thresh in thresholds:
-        far = np.mean(impostor >= thresh)
-        tar = np.mean(genuine  >= thresh)
-        if far <= target_far:
-            best_tar = max(best_tar, tar)
-    return best_tar
+def rates(results, tau):
+    n = len(results)
+    rank1 = sum(r[0] == r[1] for r in results) / n
+    frr = sum(not (r[0] == r[1] and r[2] >= tau) for r in results) / n
+    far = sum(r[3] >= tau for r in results) / n
+    return rank1, far, frr
 
 
-def compute_eer(genuine, impostor):
-    """
-    EER: threshold where FAR == FRR.
-    Returns (eer_value, threshold_at_eer).
-    """
-    thresholds = np.linspace(
-        min(genuine.min(), impostor.min()),
-        max(genuine.max(), impostor.max()),
-        10000
-    )
-    far_curve = np.array([np.mean(impostor >= t) for t in thresholds])
-    frr_curve = np.array([np.mean(genuine  <  t) for t in thresholds])
-
-    # Find EER via interpolation
-    try:
-        eer_thresh = brentq(
-            lambda t: (np.mean(impostor >= t) - np.mean(genuine < t)),
-            thresholds[0], thresholds[-1]
-        )
-        eer = np.mean(impostor >= eer_thresh)
-    except ValueError:
-        # fallback: find where |FAR - FRR| is minimised
-        diffs      = np.abs(far_curve - frr_curve)
-        idx        = np.argmin(diffs)
-        eer        = (far_curve[idx] + frr_curve[idx]) / 2
-        eer_thresh = thresholds[idx]
-
-    return float(eer), float(eer_thresh)
+def voting_rates(results, tau, window, need, trials, seed):
+    """Simulate tracks: draw `window` frames of one person, decide with >= `need` agreeing votes."""
+    rng = np.random.default_rng(seed)
+    by_person: dict = {}
+    for r in results:
+        by_person.setdefault(r[0], []).append(r)
+    fa = fr_ = total = 0
+    for p, rs in by_person.items():
+        for _ in range(trials):
+            pick = [rs[i] for i in rng.integers(0, len(rs), window)]
+            # Enrolled: count votes for the correct id at tau
+            correct = sum(r[1] == p and r[2] >= tau for r in pick)
+            fr_ += correct < need
+            # Same frames as an unknown person (own template removed)
+            fa += sum(r[3] >= tau for r in pick) >= need
+            total += 1
+    return fa / total, fr_ / total
 
 
-# ── Per-model evaluation ──────────────────────────────────────────────────────
+def far_vs_gallery_size(results, tau, sizes, seed):
+    """Open-set FAR when only k other people are enrolled: FAR grows with gallery size."""
+    rng = np.random.default_rng(seed)
+    out = {}
+    for k in sizes:
+        hits = 0
+        for r in results:
+            others = r[4]
+            pick = rng.choice(len(others), size=min(k, len(others)), replace=False)
+            hits += others[pick].max() >= tau
+        out[k] = hits / len(results)
+    return out
 
-def evaluate_model(model_key: str):
-    print(f"\n{'='*55}")
-    print(f"  Evaluating: {model_key.upper()}")
-    print(f"{'='*55}")
 
-    labels, embs = load_embeddings(model_key)
-    n_people     = len(set(labels))
-    n_embs       = len(labels)
-    print(f"  Loaded {n_embs} embeddings across {n_people} people.")
+def plot(genuine, impostor, ts, far, frr, tau, path):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(1, 2, figsize=(12, 4.5))
+    bins = np.linspace(-0.3, 1.0, 66)
+    ax[0].hist(impostor, bins, alpha=0.6, density=True, label="impostor (different people)", color="#d1495b")
+    ax[0].hist(genuine, bins, alpha=0.6, density=True, label="genuine (same person)", color="#2e86ab")
+    ax[0].axvline(tau, color="k", ls="--", label=f"tau = {tau:.3f}")
+    ax[0].set_xlabel("cosine similarity")
+    ax[0].set_ylabel("density")
+    ax[0].set_title("MobileFaceNet score distributions")
+    ax[0].legend()
+    ax[1].plot(far * 100, (1 - frr) * 100, color="#2e86ab")
+    ax[1].set_xscale("log")
+    ax[1].set_xlim(0.01, 100)
+    ax[1].set_xlabel("FAR (%)")
+    ax[1].set_ylabel("TAR (%)")
+    ax[1].set_title("ROC (1:1 verification)")
+    ax[1].grid(True, which="both", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
 
-    if n_people < 2:
-        print("  [SKIP] Need at least 2 people to evaluate.")
-        return None
 
-    genuine, impostor = build_score_pairs(labels, embs)
-    print(f"  Genuine pairs : {len(genuine)}")
-    print(f"  Impostor pairs: {len(impostor)}")
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default="", help="ONNX recognizer (default: w600k_mbf.onnx FP32)")
+    ap.add_argument("--threshold", type=float, default=float(os.getenv("MATCH_THRESHOLD", 0.40)))
+    ap.add_argument("--enroll", type=int, default=3, help="photos averaged into one enrollment template")
+    ap.add_argument("--target-far", type=float, default=0.01)
+    ap.add_argument("--window", type=int, default=5)
+    ap.add_argument("--votes", type=int, default=3)
+    ap.add_argument("--splits", type=int, default=10)
+    args = ap.parse_args()
 
-    rank1           = rank1_loo(list(labels), embs)
-    cmc             = rankk_loo(list(labels), embs, max_rank=10)
-    tar_at_far01    = compute_tar_at_far(genuine, impostor, target_far=0.01)
-    tar_at_far001   = compute_tar_at_far(genuine, impostor, target_far=0.001)
-    eer, eer_thresh = compute_eer(genuine, impostor)
+    labels, X = load_embeddings(args.model)
+    tag = Path(args.model).stem if args.model else "w600k_mbf_fp32"
+    print(f"\nModel: {tag} | {len(X)} photos | {len(set(labels))} people")
 
-    results = {
-        "model":            model_key,
-        "n_people":         n_people,
-        "n_embeddings":     n_embs,
-        "rank1":            rank1,
-        "cmc":              cmc,
-        "tar_at_far_1pct":  tar_at_far01,
-        "tar_at_far_01pct": tar_at_far001,
-        "eer":              eer,
-        "eer_threshold":    eer_thresh,
-        "genuine_mean":     float(genuine.mean()),
-        "impostor_mean":    float(impostor.mean()),
-        "_genuine_scores":  genuine,    # kept for curve generation
-        "_impostor_scores": impostor,
+    genuine, impostor = verification(labels, X)
+    e, e_t, ts, far_c, frr_c = eer(genuine, impostor)
+    tar = {f: float((genuine >= np.quantile(impostor, 1 - f)).mean()) for f in (0.01, 0.001)}
+
+    results = [r for s in range(args.splits) for r in open_set_scores(labels, X, args.enroll, s)]
+    sweep = []
+    for tau in np.round(np.arange(0.20, 0.61, 0.01), 2):
+        r1, far, frr = rates(results, tau)
+        vfar, vfrr = voting_rates(results, tau, args.window, args.votes, 200, 0)
+        sweep.append({"tau": float(tau), "rank1": r1, "far": far, "frr": frr,
+                      "track_far": vfar, "track_frr": vfrr})
+    ok = [s for s in sweep if s["far"] <= args.target_far]
+    rec = ok[0]["tau"] if ok else sweep[-1]["tau"]
+
+    r1, far, frr = rates(results, args.threshold)
+    vfar, vfrr = voting_rates(results, args.threshold, args.window, args.votes, 200, 0)
+
+    print("\n1:1 verification")
+    print(f"  genuine mean {genuine.mean():.3f} | impostor mean {impostor.mean():.3f} | max impostor {impostor.max():.3f}")
+    print(f"  EER {e*100:.2f}% at tau={e_t:.3f} | TAR@FAR=1% {tar[0.01]*100:.1f}% | TAR@FAR=0.1% {tar[0.001]*100:.1f}%")
+    print(f"\n1:N open-set (enroll={args.enroll} photos, {args.splits} random splits, {len(results)} probes)")
+    print(f"  {'tau':>5} {'Rank-1':>7} {'FAR':>7} {'FRR':>7} | {'vote FAR':>8} {'vote FRR':>8}")
+    for s in sweep:
+        if s["tau"] in (0.26, 0.30, 0.33, 0.36, 0.40, 0.45) or s["tau"] == rec:
+            mark = " <- recommended" if s["tau"] == rec else ""
+            print(f"  {s['tau']:5.2f} {s['rank1']*100:6.1f}% {s['far']*100:6.2f}% {s['frr']*100:6.2f}% |"
+                  f" {s['track_far']*100:7.2f}% {s['track_frr']*100:7.2f}%{mark}")
+    n_others = len(set(labels)) - 1
+    sizes = sorted({k for k in (1, 5, 10, 15, n_others) if k <= n_others})
+    scaling = far_vs_gallery_size(results, args.threshold, sizes, 0)
+    print(f"\nOpen-set FAR vs number of enrolled people (tau={args.threshold:.2f}):")
+    print("  " + "  ".join(f"{k} people: {v*100:.2f}%" for k, v in scaling.items()))
+
+    print(f"\nAt tau={args.threshold:.2f} (MATCH_THRESHOLD) vs proposal targets:")
+    print(f"  Rank-1 {r1*100:.1f}%  (target >= 90%)  {'OK' if r1 >= 0.90 else 'MISS'}")
+    print(f"  FAR    {far*100:.2f}%  (target <= 1%)   {'OK' if far <= 0.01 else 'MISS'}   after voting {vfar*100:.2f}%")
+    print(f"  FRR    {frr*100:.2f}%  (target <= 10%)  {'OK' if frr <= 0.10 else 'MISS'}   after voting {vfrr*100:.2f}%")
+
+    RESULTS.mkdir(exist_ok=True)
+    report = {
+        "model": tag, "n_photos": int(len(X)), "n_people": int(len(set(labels))),
+        "verification": {"genuine_mean": float(genuine.mean()), "impostor_mean": float(impostor.mean()),
+                         "eer": e, "eer_threshold": e_t, "tar_at_far_1pct": tar[0.01],
+                         "tar_at_far_0_1pct": tar[0.001]},
+        "open_set": {"enroll_photos": args.enroll, "splits": args.splits, "threshold": args.threshold,
+                     "rank1": r1, "far": far, "frr": frr, "track_far": vfar, "track_frr": vfrr,
+                     "vote": f"{args.votes}/{args.window}",
+                     "recommended_threshold_for_far_target": rec, "target_far": args.target_far,
+                     "far_vs_gallery_size": {str(k): v for k, v in scaling.items()}},
+        "sweep": sweep,
     }
-
-    print(f"\n  Results:")
-    print(f"    Rank-1 Accuracy          : {rank1*100:.2f}%")
-    print(f"    CMC Rank-5               : {cmc[4]*100:.2f}%")
-    print(f"    TAR @ FAR=1%             : {tar_at_far01*100:.2f}%")
-    print(f"    TAR @ FAR=0.1%           : {tar_at_far001*100:.2f}%")
-    print(f"    EER                      : {eer*100:.2f}%")
-    print(f"    Threshold @ EER          : {eer_thresh:.4f}  ← use this in live_demo.py")
-    print(f"    Genuine  similarity mean : {genuine.mean():.4f}")
-    print(f"    Impostor similarity mean : {impostor.mean():.4f}")
-
-    # Save per-model results (exclude numpy arrays from text file)
-    out_path = os.path.join(RESULTS_DIR, f"{model_key}_results.txt")
-    with open(out_path, "w") as f:
-        for k, v in results.items():
-            if not k.startswith("_"):
-                f.write(f"{k}: {v}\n")
-    print(f"\n  Saved to: {out_path}")
-
-    return results
-
-
-# ── Summary table ─────────────────────────────────────────────────────────────
-
-def print_summary(all_results: list):
-    valid = [r for r in all_results if r is not None]
-    if not valid:
-        print("\n[WARN] No results to summarise.")
-        return
-
-    header = f"\n{'='*80}\n  FINAL COMPARISON TABLE\n{'='*80}"
-    row_fmt = "  {:<18} {:>10} {:>12} {:>13} {:>8} {:>12}"
-    divider = "  " + "-"*78
-
-    lines = [
-        header,
-        row_fmt.format("Model", "Rank-1 %", "TAR@FAR1% %", "TAR@FAR.1% %", "EER %", "Thresh@EER"),
-        divider,
-    ]
-
-    for r in sorted(valid, key=lambda x: x["rank1"], reverse=True):
-        lines.append(row_fmt.format(
-            r["model"],
-            f"{r['rank1']*100:.2f}",
-            f"{r['tar_at_far_1pct']*100:.2f}",
-            f"{r['tar_at_far_01pct']*100:.2f}",
-            f"{r['eer']*100:.2f}",
-            f"{r['eer_threshold']:.4f}",
-        ))
-
-    lines.append(divider)
-    winner = sorted(valid, key=lambda x: x["rank1"], reverse=True)[0]
-    lines.append(f"\n  Best model (Rank-1): {winner['model'].upper()}")
-    lines.append(f"  Recommended threshold for live demo: {winner['eer_threshold']:.4f}\n")
-
-    output = "\n".join(lines)
-    print(output)
-
-    import csv
-    csv_path = os.path.join(RESULTS_DIR, "comparison_summary.csv")
-    # Exclude internal numpy arrays from CSV
-    csv_rows = [{k: v for k, v in r.items() if not k.startswith("_") and k != "cmc"}
-                for r in valid]
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=csv_rows[0].keys())
-        writer.writeheader()
-        writer.writerows(csv_rows)
-    print(f"  Summary CSV saved to: {csv_path}")
-    print(f"  Open this in Excel for your thesis table.\n")
-
-
-# ── Thesis Figures ────────────────────────────────────────────────────────────
-
-def generate_curves(all_results: list, save_dir: str):
-    """
-    Generate and save three thesis figures:
-      1. ROC Curve  — TAR vs FAR (log scale) for all models
-      2. CMC Curve  — Rank-1 through Rank-10 cumulative accuracy
-      3. DET Curve  — log(FAR) vs log(FRR)
-    """
-    valid = [r for r in all_results if r is not None]
-    if not valid:
-        return
-
-    os.makedirs(save_dir, exist_ok=True)
-
-    # ── Color palette ─────────────────────────────────────────────────────────
-    colors = ["#E63946", "#457B9D", "#2DC653", "#F4A261", "#9B5DE5"]
-    markers = ["o", "s", "^", "D", "v"]
-
-    THRESHOLDS = np.linspace(0.0, 1.0, 2000)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # FIGURE 1: ROC Curve (TAR vs FAR)
-    # ─────────────────────────────────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(7, 6))
-    fig.patch.set_facecolor("#0d0d0d")
-    ax.set_facecolor("#141414")
-
-    for i, r in enumerate(valid):
-        gen = r["_genuine_scores"]
-        imp = r["_impostor_scores"]
-        tar_vals = np.array([np.mean(gen  >= t) for t in THRESHOLDS])
-        far_vals = np.array([np.mean(imp  >= t) for t in THRESHOLDS])
-
-        # Sort by FAR ascending for a clean curve
-        sort_idx = np.argsort(far_vals)
-        ax.plot(far_vals[sort_idx], tar_vals[sort_idx],
-                color=colors[i % len(colors)], linewidth=2.0,
-                label=f"{r['model'].upper()}  (EER={r['eer']*100:.1f}%)")
-
-        # EER point
-        ax.scatter([r["eer"]], [1 - r["eer"]],
-                   color=colors[i % len(colors)], s=60,
-                   marker=markers[i % len(markers)], zorder=5)
-
-    COL_W = "#e0e0e0"
-    ax.plot([0, 1], [0, 1], "--", color="#555555", linewidth=1.0, label="Chance")
-    ax.set_xlabel("False Accept Rate (FAR)", color=COL_W, fontsize=11)
-    ax.set_ylabel("True Accept Rate (TAR)", color=COL_W, fontsize=11)
-    ax.set_title("ROC Curve — All Models", color=COL_W, fontsize=13, fontweight="bold")
-    ax.set_xlim([0, 1]);  ax.set_ylim([0, 1])
-    ax.tick_params(colors=COL_W)
-    ax.spines[:].set_color("#333333")
-    ax.legend(facecolor="#1e1e1e", edgecolor="#333333", labelcolor=COL_W, fontsize=9)
-    ax.grid(True, color="#2a2a2a", linestyle="--", linewidth=0.6)
-    plt.tight_layout()
-    roc_path = os.path.join(save_dir, "roc_curve.png")
-    plt.savefig(roc_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
-    plt.close(fig)
-    print(f"  [FIG] ROC curve saved → {roc_path}")
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # FIGURE 2: CMC Curve (Rank-1 through Rank-10)
-    # ─────────────────────────────────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(7, 5))
-    fig.patch.set_facecolor("#0d0d0d")
-    ax.set_facecolor("#141414")
-
-    ranks = list(range(1, 11))
-    for i, r in enumerate(valid):
-        cmc_vals = [v * 100 for v in r["cmc"]]
-        ax.plot(ranks, cmc_vals,
-                color=colors[i % len(colors)], linewidth=2.0,
-                marker=markers[i % len(markers)], markersize=6,
-                label=f"{r['model'].upper()}  (Rank-1={cmc_vals[0]:.1f}%)")
-
-    ax.set_xlabel("Rank", color=COL_W, fontsize=11)
-    ax.set_ylabel("Cumulative Match Rate (%)", color=COL_W, fontsize=11)
-    ax.set_title("CMC Curve — All Models", color=COL_W, fontsize=13, fontweight="bold")
-    ax.set_xticks(ranks)
-    ax.set_ylim([max(0, min(v*100 for r in valid for v in r["cmc"]) - 5), 101])
-    ax.tick_params(colors=COL_W)
-    ax.spines[:].set_color("#333333")
-    ax.legend(facecolor="#1e1e1e", edgecolor="#333333", labelcolor=COL_W, fontsize=9)
-    ax.grid(True, color="#2a2a2a", linestyle="--", linewidth=0.6)
-    plt.tight_layout()
-    cmc_path = os.path.join(save_dir, "cmc_curve.png")
-    plt.savefig(cmc_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
-    plt.close(fig)
-    print(f"  [FIG] CMC curve saved → {cmc_path}")
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # FIGURE 3: DET Curve (log FAR vs log FRR)
-    # ─────────────────────────────────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(7, 6))
-    fig.patch.set_facecolor("#0d0d0d")
-    ax.set_facecolor("#141414")
-
-    for i, r in enumerate(valid):
-        gen = r["_genuine_scores"]
-        imp = r["_impostor_scores"]
-        far_vals = np.array([np.mean(imp >= t) for t in THRESHOLDS])
-        frr_vals = np.array([np.mean(gen <  t) for t in THRESHOLDS])
-
-        # Mask zeros for log scale
-        mask = (far_vals > 0) & (frr_vals > 0)
-        ax.plot(far_vals[mask], frr_vals[mask],
-                color=colors[i % len(colors)], linewidth=2.0,
-                label=f"{r['model'].upper()}  (EER={r['eer']*100:.1f}%)")
-
-        ax.scatter([r["eer"]], [r["eer"]],
-                   color=colors[i % len(colors)], s=60,
-                   marker=markers[i % len(markers)], zorder=5)
-
-    # EER diagonal
-    ax.plot([1e-4, 1], [1e-4, 1], "--", color="#555555", linewidth=1.0, label="EER line")
-    ax.set_xscale("log");  ax.set_yscale("log")
-    ax.set_xlabel("False Accept Rate (FAR)", color=COL_W, fontsize=11)
-    ax.set_ylabel("False Reject Rate (FRR)", color=COL_W, fontsize=11)
-    ax.set_title("DET Curve — All Models", color=COL_W, fontsize=13, fontweight="bold")
-    ax.tick_params(colors=COL_W)
-    ax.spines[:].set_color("#333333")
-    ax.legend(facecolor="#1e1e1e", edgecolor="#333333", labelcolor=COL_W, fontsize=9)
-    ax.grid(True, color="#2a2a2a", linestyle="--", linewidth=0.6, which="both")
-    plt.tight_layout()
-    det_path = os.path.join(save_dir, "det_curve.png")
-    plt.savefig(det_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
-    plt.close(fig)
-    print(f"  [FIG] DET curve saved → {det_path}")
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # FIGURE 4: Latency vs Rank-1 scatter
-    # ─────────────────────────────────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(7, 5))
-    fig.patch.set_facecolor("#0d0d0d")
-    ax.set_facecolor("#141414")
-
-    for i, r in enumerate(valid):
-        # Try to load latency from results file
-        lat = _load_latency(r["model"])
-        ax.scatter([lat], [r["rank1"] * 100],
-                   color=colors[i % len(colors)], s=120,
-                   marker=markers[i % len(markers)], zorder=5, label=r["model"].upper())
-        ax.annotate(f"  {r['model'].upper()}", (lat, r["rank1"] * 100),
-                    color=colors[i % len(colors)], fontsize=9)
-
-    ax.set_xlabel("Avg. Inference Latency (ms)", color=COL_W, fontsize=11)
-    ax.set_ylabel("Rank-1 Accuracy (%)", color=COL_W, fontsize=11)
-    ax.set_title("Speed vs Accuracy Trade-off", color=COL_W, fontsize=13, fontweight="bold")
-    ax.tick_params(colors=COL_W)
-    ax.spines[:].set_color("#333333")
-    ax.grid(True, color="#2a2a2a", linestyle="--", linewidth=0.6)
-    plt.tight_layout()
-    scatter_path = os.path.join(save_dir, "latency_vs_accuracy.png")
-    plt.savefig(scatter_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
-    plt.close(fig)
-    print(f"  [FIG] Latency-Accuracy scatter saved → {scatter_path}")
-
-
-def _load_latency(model_key: str) -> float:
-    """Load avg_latency from results file if available."""
-    path = os.path.join(RESULTS_DIR, f"{model_key}_results.txt")
-    if not os.path.exists(path):
-        return 0.0
-    with open(path) as f:
-        for line in f:
-            if line.startswith("avg_latency"):
-                try:
-                    return float(line.split(":")[1].strip())
-                except Exception:
-                    pass
-    # Fallback known values
-    known = {"arcface": 140, "adaface": 870, "magface": 14,
-             "facenet_vgg": 50, "facenet_casia": 53}
-    return known.get(model_key, 100.0)
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-def main(target_model=None, generate_plots=True):
-    from models import ALL_MODELS
-
-    model_keys = [target_model] if target_model else list(ALL_MODELS.keys())
-
-    all_results = []
-    for key in model_keys:
-        try:
-            result = evaluate_model(key)
-            all_results.append(result)
-        except FileNotFoundError as e:
-            print(f"\n[SKIP] {key}: {e}")
-        except Exception as e:
-            import traceback
-            print(f"\n[ERROR] {key}: {e}")
-            traceback.print_exc()
-
-    valid = [r for r in all_results if r is not None]
-
-    if len(valid) > 1:
-        print_summary(valid)
-
-        if generate_plots:
-            print(f"\n{'='*60}")
-            print("  GENERATING THESIS FIGURES")
-            print(f"{'='*60}")
-            generate_curves(valid, RESULTS_DIR)
-            print(f"\n  Figures saved to: {RESULTS_DIR}")
-            print("  Files: roc_curve.png, cmc_curve.png, det_curve.png, latency_vs_accuracy.png")
-    elif valid:
-        r = valid[0]
-        print(f"\n  Recommended threshold for live demo: {r['eer_threshold']:.4f}")
-        if generate_plots and r.get("_genuine_scores") is not None:
-            generate_curves([r], RESULTS_DIR)
-
-    print(f"\n  Next step: python scripts/live_demo.py --model <best_model>\n")
+    out = RESULTS / f"evaluation_{tag}.json"
+    out.write_text(json.dumps(report, indent=2))
+    plot(genuine, impostor, ts, far_c, frr_c, args.threshold, RESULTS / f"scores_roc_{tag}.png")
+    print(f"\nSaved {out.relative_to(ROOT)} and results/scores_roc_{tag}.png")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default=None,
-                        help="Evaluate only one model. Options: arcface, facenet_vgg, facenet_casia, adaface, magface")
-    parser.add_argument("--no-plots", action="store_true",
-                        help="Skip figure generation")
-    args = parser.parse_args()
-    main(target_model=args.model, generate_plots=not args.no_plots)
+    main()

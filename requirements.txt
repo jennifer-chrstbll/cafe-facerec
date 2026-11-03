@@ -1,0 +1,4 @@
+# Research / PC side (scripts/). The device itself only needs uno_q/requirements.txt.
+-r uno_q/requirements.txt
+matplotlib
+onnx

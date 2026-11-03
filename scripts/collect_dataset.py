@@ -3,12 +3,10 @@ collect_dataset.py
 ------------------
 Captures 10 face photos per person from your webcam.
 
-Pipeline:
-  1. SCRFD detection (InsightFace buffalo_l/det_10g.onnx)
+Pipeline (identical to the cashier device, uno_q/facerec_uno_q.py):
+  1. SCRFD-0.5G detection (det_500m.onnx)
      → detects face bounding box + 5 facial landmarks
-     Note: SCRFD = Sample and Computation Redistribution for Efficient Face Detection
-     (Guo et al. 2021). InsightFace buffalo_l uses SCRFD, not RetinaFace.
-  2. norm_crop (affine warp to canonical 112×112 pose)
+  2. 5-point similarity alignment to the 112×112 ArcFace template
      → both eyes at fixed coords, face upright regardless of head tilt
   3. Laplacian sharpness filter — reject blurry frames
   4. Save aligned 112×112 crop (same format models were trained on)
@@ -25,8 +23,9 @@ import argparse
 import time
 import numpy as np
 
-PROJECT_ROOT = r"D:\Projects\cafe_facerec"
-sys.path.insert(0, PROJECT_ROOT)
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "uno_q"))
+import facerec_uno_q as fr  # noqa: E402
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DATASET_DIR   = os.path.join(PROJECT_ROOT, "dataset")
@@ -36,7 +35,7 @@ FACE_MIN_SIZE = 60          # minimum face bbox width/height in pixels
 CAPTURE_DELAY = 0.5         # seconds between auto-captures (for pose variety)
 WARMUP_FRAMES = 20          # discard first N frames for camera auto-exposure
 DET_THRESH    = 0.5         # SCRFD detection confidence threshold
-DET_SIZE      = (320, 320)  # SCRFD input size (lowered from 640 for faster CPU inference)
+DET_SIZE      = 640         # SCRFD input width (desktop capture, so larger than on the device)
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── Colors ────────────────────────────────────────────────────────────────────
@@ -53,22 +52,26 @@ def laplacian_sharpness(gray_img: np.ndarray) -> float:
     return cv2.Laplacian(gray_img, cv2.CV_64F).var()
 
 
+class _Face:
+    def __init__(self, det, kps):
+        self.bbox, self.det_score, self.kps = det[:4], float(det[4]), kps
+
+
+class _Detector:
+    """SCRFD-0.5G from the device code, returning objects shaped like insightface faces."""
+    def __init__(self):
+        self._det = fr.SCRFD(fr.find_model("det_500m.onnx"), os.cpu_count() or 4, DET_SIZE, DET_THRESH)
+
+    def get(self, frame):
+        dets, kpss = self._det.detect(frame)
+        return [_Face(d, k) for d, k in zip(dets, kpss)]
+
+
 def load_face_detector():
-    """
-    Load InsightFace FaceAnalysis with detection-only module.
-    Uses buffalo_l pack → det_10g.onnx (SCRFD-10GF detector).
-    Outputs bounding boxes + 5 facial landmarks per face.
-    """
-    from insightface.app import FaceAnalysis
-    print("[DETECTOR] Loading SCRFD (buffalo_l / det_10g.onnx) ...")
-    app = FaceAnalysis(
-        name="buffalo_l",
-        allowed_modules=["detection"],
-        providers=["CPUExecutionProvider"],
-    )
-    app.prepare(ctx_id=0, det_size=DET_SIZE)
-    print("[DETECTOR] Ready.\n")
-    return app
+    print("[DETECTOR] Loading SCRFD-0.5G (det_500m.onnx) ...")
+    det = _Detector()
+    print("[DETECTOR] Ready.")
+    return det
 
 
 def draw_landmarks(display: np.ndarray, kps: np.ndarray):
@@ -78,8 +81,6 @@ def draw_landmarks(display: np.ndarray, kps: np.ndarray):
 
 
 def collect(name: str, photos_needed: int):
-    from insightface.utils import face_align
-
     person_dir = os.path.join(DATASET_DIR, name)
     os.makedirs(person_dir, exist_ok=True)
 
@@ -150,7 +151,7 @@ def collect(name: str, photos_needed: int):
             else:
                 # ── norm_crop: landmark-based affine alignment ──────────────
                 try:
-                    aligned = face_align.norm_crop(frame, face.kps, image_size=112)
+                    aligned = fr.align_face(frame, face.kps)
                 except Exception as e:
                     cv2.putText(display, f"Alignment error: {e}", (20, 45),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, COL_RED, 1)
@@ -199,7 +200,7 @@ def collect(name: str, photos_needed: int):
                     f"{name}  |  {saved}/{photos_needed} saved  |  {rejected} rejected",
                     (20, h_frame - 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, COL_WHITE, 2)
-        cv2.putText(display, "Detector: SCRFD + norm_crop alignment",
+        cv2.putText(display, "Detector: SCRFD-0.5G + 5-point alignment",
                     (20, h_frame - 45),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, (160, 160, 160), 1)
 
@@ -221,12 +222,12 @@ def collect(name: str, photos_needed: int):
         print(f"       {rejected} blurry frames were auto-rejected.")
     if saved == photos_needed:
         print(f"\n  Next step:")
-        print(f"    python scripts/extract_embeddings.py")
+        print(f"    python scripts/evaluate.py")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Collect aligned face photos using SCRFD detector + norm_crop."
+        description="Collect aligned face photos using SCRFD-0.5G + 5-point alignment."
     )
     parser.add_argument("--name",   required=True,
                         help="Person's name (no spaces recommended, e.g. Jennifer)")

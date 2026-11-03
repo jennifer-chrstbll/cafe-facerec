@@ -86,3 +86,9 @@ logs/
 Thumbs.db
 ehthumbs.db
 desktop.ini
+
+# ==========================================
+# 8. Superseded code/results kept locally only (safe to delete)
+# ==========================================
+legacy/
+uno_q/models/
