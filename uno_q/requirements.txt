@@ -1,6 +1,6 @@
+# Arduino UNO Q (Debian, aarch64). onnxruntime is NOT needed (and crashes on this CPU).
 numpy
-opencv-python-headless
-onnxruntime
-faiss-cpu
+opencv-python-headless>=4.8   # OpenCV DNN runs SCRFD + MobileFaceNet
+faiss-cpu                     # optional; numpy search is used if it is missing
 psycopg2-binary
 python-dotenv

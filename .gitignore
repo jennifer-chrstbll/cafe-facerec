@@ -91,4 +91,8 @@ desktop.ini
 # 8. Superseded code/results kept locally only (safe to delete)
 # ==========================================
 legacy/
-uno_q/models/
+uno_q/models/*
+# fixed-size SCRFD shipped with the device program (OpenCV 4.x cannot import the dynamic one)
+!uno_q/models/det_500m_320.onnx
+# face-vault key and local state on the UNO Q -- never commit
+uno_q/data/

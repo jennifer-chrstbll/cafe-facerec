@@ -35,7 +35,7 @@ FACE_MIN_SIZE = 60          # minimum face bbox width/height in pixels
 CAPTURE_DELAY = 0.5         # seconds between auto-captures (for pose variety)
 WARMUP_FRAMES = 20          # discard first N frames for camera auto-exposure
 DET_THRESH    = 0.5         # SCRFD detection confidence threshold
-DET_SIZE      = 640         # SCRFD input width (desktop capture, so larger than on the device)
+DET_SIZE      = 320         # SCRFD input size, same fixed-size model as on the device
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── Colors ────────────────────────────────────────────────────────────────────
@@ -53,18 +53,17 @@ def laplacian_sharpness(gray_img: np.ndarray) -> float:
 
 
 class _Face:
-    def __init__(self, det, kps):
-        self.bbox, self.det_score, self.kps = det[:4], float(det[4]), kps
+    def __init__(self, f):
+        self.bbox, self.det_score, self.kps = f.box, float(f.score), f.kps
 
 
 class _Detector:
     """SCRFD-0.5G from the device code, returning objects shaped like insightface faces."""
     def __init__(self):
-        self._det = fr.SCRFD(fr.find_model("det_500m.onnx"), os.cpu_count() or 4, DET_SIZE, DET_THRESH)
+        self._det = fr.SCRFD(fr.det_model_path(DET_SIZE), DET_SIZE, DET_THRESH)
 
     def get(self, frame):
-        dets, kpss = self._det.detect(frame)
-        return [_Face(d, k) for d, k in zip(dets, kpss)]
+        return [_Face(f) for f in self._det.detect(frame)]
 
 
 def load_face_detector():
@@ -151,7 +150,7 @@ def collect(name: str, photos_needed: int):
             else:
                 # ── norm_crop: landmark-based affine alignment ──────────────
                 try:
-                    aligned = fr.align_face(frame, face.kps)
+                    aligned = fr.align(frame, face.kps)
                 except Exception as e:
                     cv2.putText(display, f"Alignment error: {e}", (20, 45),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, COL_RED, 1)

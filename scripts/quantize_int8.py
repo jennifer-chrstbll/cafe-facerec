@@ -71,9 +71,13 @@ def main():
                         weight_type=QuantType.QInt8, activation_type=QuantType.QUInt8,
                         nodes_to_exclude=head)
 
-    fp32 = fr.MobileFaceNet(src, 4)
-    int8 = fr.MobileFaceNet(str(dst), 4)
-    cos = [float(fp32.embed(img) @ int8.embed(img)) for img in (cv2.imread(str(p)) for p in paths[::5])]
+    def embedder(path):
+        s = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+        name = s.get_inputs()[0].name
+        return lambda img: fr.l2n(s.run(None, {name: preprocess(img)})[0])
+
+    fp32, int8 = embedder(src), embedder(dst)
+    cos = [float(fp32(img) @ int8(img)) for img in (cv2.imread(str(p)) for p in paths[::5])]
     print(f"Saved {dst.relative_to(ROOT)} ({dst.stat().st_size // 1024} KB, FP32 is "
           f"{Path(src).stat().st_size // 1024} KB)")
     print(f"Mean cosine(FP32, INT8) on dataset: {np.mean(cos):.3f}  -> enroll and recognise with the same model")

@@ -1,18 +1,19 @@
-# systemd unit: starts the face-recognition agent at boot and restarts it if it crashes.
+# systemd unit: starts the face-recognition program at boot and restarts it if it stops
+# (also after "Mulai ulang" in the CRM).
 #   sudo cp facerec.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now facerec
-#   journalctl -u facerec -f          # live logs
+#   journalctl -u facerec -f          # live log
 [Unit]
-Description=Cafe FaceRec cashier agent (SCRFD + MobileFaceNet + FAISS)
-After=network-online.target
+Description=Cafe face recognition (SCRFD + MobileFaceNet + FAISS) on the Arduino UNO Q
+After=network-online.target time-sync.target
 Wants=network-online.target
 
 [Service]
 User=arduino
 WorkingDirectory=/home/arduino/facerec
-ExecStart=/home/arduino/facerec/venv/bin/python facerec_uno_q.py
+ExecStart=/home/arduino/facerec-env/bin/python -u facerec_uno_q.py
 Restart=always
-RestartSec=5
+RestartSec=3
 Environment=PYTHONUNBUFFERED=1
 
 [Install]

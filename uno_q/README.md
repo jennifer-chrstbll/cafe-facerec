@@ -1,84 +1,73 @@
-# Arduino UNO Q — cashier face-recognition agent
+# Arduino UNO Q — cashier face recognition
 
-Everything that runs on the UNO Q is in this folder:
+Everything that runs on the UNO Q is in this folder.
 
 | File | Purpose |
 |---|---|
-| `facerec_uno_q.py` | The agent (detector, alignment, recognizer, FAISS, voting, Supabase, HTTP server) |
-| `.env.example` | Configuration template → copy to `.env` |
-| `requirements.txt` | Python packages |
-| `facerec.service` | systemd unit (auto-start at boot) |
-| `models/` | Optional: put `det_500m.onnx` + `w600k_mbf.onnx` here for offline install |
+| `facerec_uno_q.py` | the program: SCRFD-0.5G + 5-point alignment + MobileFaceNet + face vault + FAISS + session decision; talks to Supabase and the Raspberry Pi |
+| `models/det_500m_320.onnx` | SCRFD with a fixed 320×320 input (OpenCV 4.x cannot load the original). MobileFaceNet (`w600k_mbf.onnx`) is taken from `~/.insightface/models/buffalo_sc/` (already on the board) or downloaded once |
+| `.env.example` | settings template → copy to `.env` |
+| `requirements.txt` | Python packages (no onnxruntime: it crashes with "Illegal instruction" on this CPU) |
+| `facerec.service` | systemd unit (start at boot, restart after a crash or "Mulai ulang" in the CRM) |
 
-It replaces the old `camera_agent.py`. Same port (5001) and the same endpoints the CRM already
-calls (`/video_feed`, `/latest-embedding`, `/extract-embedding`), so the CRM needs no change.
+## Hardware
 
-## Install
+Face webcam → **powered USB‑C hub** → UNO Q. The UNO Q joins the cafe Wi‑Fi (set up once in
+Arduino App Lab). It does not need a cable to the Raspberry Pi.
 
-From the PC (in the repo root):
+## Install (once)
 
-```bash
-scp -r uno_q arduino@192.168.18.80:~/facerec
-# optional offline models (otherwise downloaded automatically on first start, ~15 MB):
-scp ~/.insightface/models/buffalo_sc/det_500m.onnx ~/.insightface/models/buffalo_sc/w600k_mbf.onnx \
-    arduino@192.168.18.80:~/facerec/models/
+From the laptop, with the board on USB (Arduino App Lab closed):
+
+```powershell
+$adb = "C:\Users\USER\AppData\Local\Android\Sdk\platform-tools\adb.exe"
+& $adb shell "mkdir -p /home/arduino/facerec/old && cd /home/arduino/facerec && mv -f camera_agent.py* daftar_wajah.py* penyimpanan_lokal.py* titik_wajah.py* face_recognition_module.py models.py old/ 2>/dev/null; true"
+& $adb push D:\Projects\DEPLOY\ArduinoUnoQ\. /home/arduino/facerec/
 ```
 
-On the UNO Q (`ssh arduino@192.168.18.80`):
+On the board (`& $adb shell`, or SSH over Wi‑Fi):
 
 ```bash
 cd ~/facerec
-python3 -m venv venv
-venv/bin/pip install -r requirements.txt
-cp .env.example .env && nano .env          # set DATABASE_URL
-pkill -f camera_agent.py || true           # stop the old agent (port 5001)
-venv/bin/python facerec_uno_q.py           # test run, Ctrl+C to stop
-```
-
-Check `http://192.168.18.80:5001/video_feed` (live overlay) and `http://192.168.18.80:5001/health`.
-
-Auto-start at boot:
-
-```bash
+~/facerec-env/bin/pip install -r requirements.txt     # the existing venv already has most of it
+cp .env.example .env && nano .env                     # DATABASE_URL, VAULT_KEY, PI_FACE_URL, FACE_TOKEN
+sudo timedatectl set-ntp true                         # correct clock (needs Wi-Fi)
+~/facerec-env/bin/python facerec_uno_q.py             # test run; Ctrl+C to stop
 sudo cp facerec.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now facerec
-journalctl -u facerec -f
 ```
 
-## How it talks to the rest of the system
+The Raspberry Pi used to start the old `camera_agent.py` over USB. Switch that off on the Pi
+(see the Pi README): `sudo systemctl disable --now cafe-wajah-unoq cafe-jembatan-usb`.
 
-| What | How |
+## What it does
+
+| Event | Result |
 |---|---|
-| Recognitions, visits | rows in Supabase `recognition_logs`, `visits` |
-| Face enrollment from the CRM | CRM inserts `enrollment_requests`; this agent polls it every 1.5 s, captures the face in front of the camera and writes `embeddings` itself (the cloud website cannot reach the board on the cafe LAN) |
-| Status light in the CRM | heartbeat row in `device_status` every 30 s (FPS, gallery size) |
-| Identity association | after each confirmed customer: `POST {CRM_URL}/api/association/bind` with header `x-device-key` |
-| Live video | `http://<uno-q-ip>:5001/video_feed`, only reachable on the cafe Wi-Fi |
+| A face is in front of the cashier | a *session* of up to 10 frames (≤ 2.5 s) of the same face; frames that are cut off, too small, in profile, too dark/bright or blurry are ignored |
+| End of the session | **known** when the mean of the 3 best frames ≥ τ = 0.40, it beats the next customer by ≥ 0.08, and ≥ 60 % of the best frames vote for the same customer. **unknown** when the best score < 0.35. Otherwise **not sure** (nothing is recorded) |
+| Known | `recognition_logs` row (at most every 30 s per customer), the customer's visit is opened (`get_or_create_visit`), and the face event is sent to the Pi (`PI_FACE_URL`), which links it to the body at the cashier |
+| CRM "Daftarkan wajah" (after consent) | the board captures 20 good frames, keeps the 5 best, checks they are the same person and not already enrolled as someone else, stores them (vault‑protected) |
+| CRM "Perangkat" | heartbeat every 10 s, self-check, reload gallery, restart, choose the webcam, live preview (only while someone watches) |
 
-Requires `cafe-crm/database/004_integration.sql` to be applied; without it enrollment and
-heartbeat switch themselves off with a warning and recognition keeps working.
+Measured on the project dataset with this exact rule (`scripts/evaluate.py`):
+enrolled customers 99.85 % correct, 0 % wrong person; unknown faces 0 % accepted.
 
-## Before the field test
+## Face vault
 
-1. **Gallery check:** `venv/bin/python ../scripts/gallery_tool.py check` (copy `scripts/` too, or
-   run it on any machine that reaches the database). Customers enrolled before 2026-09-12 were
-   made with an older model and must be re-enrolled:
-   `gallery_tool.py reenroll --customer-id <uuid> --agent http://localhost:5001`.
-2. **Latency on the device:** `scripts/benchmark_edge.py --camera` → `results/edge_benchmark_<host>.json`.
-3. **Calibration on site** (proposal step 3):
-   - `MATCH_THRESHOLD`: run `scripts/evaluate.py` on the participants' photos; use the
-     recommended τ (open-set FAR ≤ 1%). Re-run when the gallery grows, since FAR rises with the
-     number of enrolled people.
-   - `MIN_FACE_PX`: stand where customers pay; faces there should be ≥ this size
-     (see the box on `/video_feed`, grey "move closer" means too small).
-   - `MIN_SHARPNESS` / `MAX_YAW`: lower them if faces at the counter stay on
-     "blurry"/"face the camera" in the cafe lighting.
+Stored embeddings are multiplied by a secret orthogonal matrix derived from `VAULT_KEY`
+(cancelable biometrics). Cosine similarity — and therefore recognition — is unchanged, but the
+stored numbers are not MobileFaceNet outputs and cannot be matched against other systems.
+**Back up `VAULT_KEY`.** If it is lost, every customer must be enrolled again.
+Faces enrolled with an older pipeline (`model_name` ≠ `mbf-scrfd-v2`) are ignored; the CRM
+page *Wajah Terdaftar* lists them for re-enrollment.
 
 ## Troubleshooting
 
-| Symptom | Fix |
+| Symptom (CRM → Perangkat → Cek perangkat) | Fix |
 |---|---|
-| `could not translate host name db.<ref>.supabase.co` | The direct host is IPv6-only. Use the *Session pooler* connection string from Supabase → Project Settings → Database. |
-| `Address already in use` | Old `camera_agent.py` or a second copy is running: `pkill -f camera_agent.py`. |
-| Low FPS | Keep `DET_SIZE=320`, `NUM_THREADS=4`; close the stream when not needed (encoding only runs while someone watches). |
-| Everyone "Unknown" | Gallery empty or legacy embeddings → `gallery_tool.py check`; check `/health` → `gallery`. |
+| Kamera wajah: tidak ada gambar | replug the webcam (hub must be powered), pick it again in *Perangkat* |
+| Raspberry Pi: gagal | `PI_FACE_URL` must be the Pi's IP; same `FACE_TOKEN` on both |
+| Jam papan: selisih | `sudo timedatectl set-ntp true` (needs Wi‑Fi) |
+| Customer always "not sure" | re-enroll in good light; check the camera is at face height, 0.5–1.5 m |
+| Log: `Illegal instruction` | something imported onnxruntime; this program does not — use `facerec_uno_q.py` |

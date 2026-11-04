@@ -43,8 +43,23 @@ DATASET = ROOT / "dataset"
 RESULTS = ROOT / "results"
 
 
+class OrtEmbedder:
+    """For --model (e.g. the INT8 experiment): ONNX Runtime on the laptop. The device itself
+    runs FP32 through OpenCV DNN (fr.MobileFaceNet), which gives identical embeddings."""
+
+    def __init__(self, path: str):
+        import onnxruntime as ort
+        self.s = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+        self.name = self.s.get_inputs()[0].name
+
+    def embed(self, img: np.ndarray) -> np.ndarray:
+        x = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)
+        x = ((x - 127.5) / 127.5).transpose(2, 0, 1)[None]
+        return fr.l2n(self.s.run(None, {self.name: x})[0])
+
+
 def load_embeddings(model_path: str):
-    model = fr.MobileFaceNet(fr.find_model("w600k_mbf.onnx", model_path), os.cpu_count() or 4)
+    model = OrtEmbedder(model_path) if model_path else fr.MobileFaceNet(fr.find_model("w600k_mbf.onnx"))
     names, embs = [], []
     for person in sorted(p for p in DATASET.iterdir() if p.is_dir()):
         for img_path in sorted(person.glob("*.jpg")):
@@ -81,7 +96,7 @@ def open_set_scores(labels, X, n_enroll, seed):
     templates, probes = {}, []
     for p in people:
         idx = rng.permutation(np.where(labels == p)[0])
-        templates[p] = fr.l2_normalize(X[idx[:n_enroll]].mean(0))
+        templates[p] = fr.l2n(X[idx[:n_enroll]].mean(0))
         probes += [(p, j) for j in idx[n_enroll:]]
     T = np.stack([templates[p] for p in people])
     out = []
@@ -121,6 +136,46 @@ def voting_rates(results, tau, window, need, trials, seed):
             fa += sum(r[3] >= tau for r in pick) >= need
             total += 1
     return fa / total, fr_ / total
+
+
+def session_rates(labels, X, cfg, n_enroll: int, splits: int, trials: int, seed: int) -> dict:
+    """
+    The exact decision rule of the device (fr.decide): a session of 3-5 frames of one face,
+    mean of the 3 best >= tau, margin to the next customer >= m, >= vote_ratio of the frames
+    agree. Each person is enrolled with n_enroll separate embeddings (as the CRM enrollment
+    stores 5). Genuine: person enrolled. Impostor: the same sessions with that person removed
+    from the gallery (leave-one-person-out), i.e. an unknown customer at the cashier.
+    """
+    rng = np.random.default_rng(seed)
+    people = sorted(set(labels))
+    g = {"correct": 0, "wrong": 0, "uncertain": 0, "unknown": 0}
+    imp = {"false_accept": 0, "uncertain": 0, "unknown": 0}
+    n = 0
+    for _ in range(splits):
+        enroll, probes = {}, {}
+        for p in people:
+            idx = rng.permutation(np.where(labels == p)[0])
+            enroll[p], probes[p] = idx[:n_enroll], idx[n_enroll:]
+        full = fr.Gallery()
+        full.load([(p, p, X[j]) for p in people for j in enroll[p]])
+        for p in people:
+            loo = fr.Gallery()
+            loo.load([(q, q, X[j]) for q in people if q != p for j in enroll[q]])
+            for _t in range(trials):
+                k = int(rng.integers(3, min(5, len(probes[p])) + 1))
+                pick = rng.choice(probes[p], size=k, replace=False)
+                sess = fr.Session()
+                sess.samples = [fr.Sample(1.0, X[j]) for j in pick]
+                d = fr.decide(cfg, full, sess)
+                if d.state == "known":
+                    g["correct" if d.customer_id == p else "wrong"] += 1
+                else:
+                    g[d.state] += 1
+                d2 = fr.decide(cfg, loo, sess)
+                imp["false_accept" if d2.state == "known" else d2.state] += 1
+                n += 1
+    return {"sessions": n, "genuine": {k: v / n for k, v in g.items()},
+            "impostor": {k: v / n for k, v in imp.items()}}
 
 
 def far_vs_gallery_size(results, tau, sizes, seed):
@@ -214,6 +269,18 @@ def main():
     print(f"  FAR    {far*100:.2f}%  (target <= 1%)   {'OK' if far <= 0.01 else 'MISS'}   after voting {vfar*100:.2f}%")
     print(f"  FRR    {frr*100:.2f}%  (target <= 10%)  {'OK' if frr <= 0.10 else 'MISS'}   after voting {vfrr*100:.2f}%")
 
+    cfg = fr.Config()
+    cfg.match_threshold = args.threshold
+    sr = session_rates(labels, X, cfg, 5, args.splits, 20, 0)
+    gen, imp = sr["genuine"], sr["impostor"]
+    print(f"\nDevice decision rule (session of 3-5 frames, mean of best 3 >= {cfg.match_threshold:.2f}, "
+          f"margin >= {cfg.match_margin:.2f}, vote >= {cfg.vote_ratio:.0%}), enroll = 5 embeddings, "
+          f"{sr['sessions']} sessions:")
+    print(f"  enrolled customer : correct {gen['correct']*100:.2f}% | WRONG person {gen['wrong']*100:.2f}% | "
+          f"not sure {gen['uncertain']*100:.2f}% | 'unknown' {gen['unknown']*100:.2f}%  -> FRR {(1-gen['correct'])*100:.2f}%")
+    print(f"  unknown customer  : FALSE ACCEPT {imp['false_accept']*100:.2f}% | not sure {imp['uncertain']*100:.2f}% | "
+          f"unknown {imp['unknown']*100:.2f}%")
+
     RESULTS.mkdir(exist_ok=True)
     report = {
         "model": tag, "n_photos": int(len(X)), "n_people": int(len(set(labels))),
@@ -226,6 +293,8 @@ def main():
                      "recommended_threshold_for_far_target": rec, "target_far": args.target_far,
                      "far_vs_gallery_size": {str(k): v for k, v in scaling.items()}},
         "sweep": sweep,
+        "device_session_rule": {"threshold": cfg.match_threshold, "margin": cfg.match_margin,
+                                "vote_ratio": cfg.vote_ratio, "enroll_embeddings": 5, **sr},
     }
     out = RESULTS / f"evaluation_{tag}.json"
     out.write_text(json.dumps(report, indent=2))

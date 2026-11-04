@@ -1,31 +1,27 @@
 """
 gallery_tool.py
 ---------------
-Inspect and repair the face gallery in Supabase (table `embeddings`).
+Read-only report on the face gallery in Supabase (table `embeddings`).
 
-    python3 scripts/gallery_tool.py check
-        Read-only report: which embeddings were made by an older pipeline (ResNet50 before
-        Sep 2026, or MobileFaceNet without alignment before 2026-09-12), wrong dimensions,
-        customers that look enrolled twice (two customer_ids with the same face), and
-        customers without any face.
+    python scripts/gallery_tool.py check
 
-    python3 scripts/gallery_tool.py reenroll --customer-id <uuid> [--agent http://192.168.18.80:5001]
-        Customer stands in front of the cashier camera; their old embeddings are replaced by
-        a fresh MobileFaceNet template from the agent's /latest-embedding, then the agent
-        reloads its gallery.
+Shows:
+  * customers enrolled with the current device pipeline (model_name = mbf-scrfd-v2, vault-protected)
+  * customers whose only face data comes from an OLD pipeline (ResNet50, MobileFaceNet without
+    alignment, or without the vault): the UNO Q ignores these rows, so the customer must be
+    enrolled again from the CRM (Pelanggan -> Daftarkan wajah, or Wajah Terdaftar)
+  * possible duplicate enrollments: two customers whose faces match each other (cosine >= tau)
+  * active customers without any face
 
-DATABASE_URL is read from the environment or uno_q/.env. Run it where the database host is
-reachable (e.g. on the UNO Q itself).
+Enrolling and deleting faces is done in the CRM (with the customer's consent), not here.
+DATABASE_URL is read from the environment or uno_q/.env.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,108 +37,64 @@ def connect():
     return psycopg2.connect(url, connect_timeout=15)
 
 
-def check(args):
+def check(_args):
     conn = connect()
     with conn.cursor() as cur:
-        cur.execute("""SELECT c.customer_id::text, c.name, c.is_active, e.model_name, e.created_at,
-                              e.embedding_vector::text
+        cur.execute("""SELECT c.customer_id::text, c.name, c.is_active, e.model_name, e.embedding_vector::text
                        FROM customers c LEFT JOIN embeddings e ON e.customer_id = c.customer_id
-                       ORDER BY e.created_at NULLS FIRST""")
+                       WHERE c.customer_id <> '00000000-0000-0000-0000-000000000001'""")
         rows = cur.fetchall()
     conn.close()
 
-    no_face, legacy, bad_dim, good = [], [], [], []
-    for cid, name, active, model, created, vec in rows:
+    current: dict[str, list] = {}
+    names: dict[str, str] = {}
+    old_only: dict[str, set] = {}
+    no_face = []
+    for cid, name, active, model, vec in rows:
+        names[cid] = name or "-"
         if vec is None:
-            no_face.append((cid, name))
+            if active:
+                no_face.append(cid)
             continue
-        v = fr.parse_vector(vec)
-        day = str(created)[:10] if created else "unknown"
-        if v.shape != (fr.EMBED_DIM,):
-            bad_dim.append((cid, name, v.shape))
-        elif day == "unknown" or day < fr.PIPELINE_SINCE:
-            legacy.append((cid, name, day, active))
+        if model == fr.MODEL_NAME:
+            v = fr.parse_vec(vec)
+            if v.shape == (fr.EMBED_DIM,):
+                current.setdefault(cid, []).append(fr.l2n(v))
         else:
-            good.append((cid, name, fr.l2_normalize(v), active))
+            old_only.setdefault(cid, set()).add(model or "?")
+    for cid in list(old_only):
+        if cid in current:
+            del old_only[cid]
 
-    print(f"\nCustomers: {len({r[0] for r in rows})} | embeddings: {sum(r[5] is not None for r in rows)}")
-    print(f"  OK (MobileFaceNet + alignment, since {fr.PIPELINE_SINCE}) : {len(good)}")
-    print(f"  LEGACY (older model/pipeline, re-enroll)               : {len(legacy)}")
-    print(f"  wrong dimension                                        : {len(bad_dim)}")
-    print(f"  customers without a face                               : {len(no_face)}")
-    for cid, name, day, active in legacy:
-        print(f"    re-enroll: {name or '-':20s} {cid}  enrolled {day}{'' if active else '  (inactive)'}")
+    print(f"\nCustomers: {len(names)}")
+    print(f"  enrolled with the current pipeline ({fr.MODEL_NAME}) : {len(current)}")
+    print(f"  only OLD face data -> enroll again from the CRM    : {len(old_only)}")
+    for cid, models in sorted(old_only.items(), key=lambda kv: names[kv[0]]):
+        print(f"    {names[cid]:24s} {cid}  ({', '.join(sorted(models))})")
+    print(f"  active, no face                                    : {len(no_face)}")
 
-    # Two different customer_ids with the same face -> the gallery would flip between them.
     tau = fr.Config().match_threshold
+    ids = sorted(current)
     dup = []
-    for i in range(len(good)):
-        for j in range(i + 1, len(good)):
-            if good[i][0] != good[j][0]:
-                s = float(good[i][2] @ good[j][2])
-                if s >= tau:
-                    dup.append((s, good[i][1], good[i][0], good[j][1], good[j][0]))
+    for i in range(len(ids)):
+        for j in range(i + 1, len(ids)):
+            s = max(float(a @ b) for a in current[ids[i]] for b in current[ids[j]])
+            if s >= tau:
+                dup.append((s, ids[i], ids[j]))
     if dup:
-        print(f"\nPossible duplicate enrollments (cosine >= tau={tau:.2f}):")
-        for s, n1, c1, n2, c2 in sorted(dup, reverse=True):
-            print(f"  {s:.3f}  {n1} ({c1[:8]})  <->  {n2} ({c2[:8]})")
-    print("\nTip: set GALLERY_SINCE=" + fr.PIPELINE_SINCE + " in uno_q/.env to ignore legacy rows "
-          "until they are re-enrolled.")
-
-
-def http_json(url: str, method: str = "GET"):
-    req = urllib.request.Request(url, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return r.status, json.loads(r.read() or b"{}")
-    except urllib.error.HTTPError as e:
-        return e.code, json.loads(e.read() or b"{}")
-
-
-def reenroll(args):
-    status, data = http_json(f"{args.agent}/latest-embedding")
-    if status != 200:
-        sys.exit(f"Agent returned {status}: {data.get('detail')}")
-    emb = data["embedding"]
-    if len(emb) != fr.EMBED_DIM:
-        sys.exit("Unexpected embedding size from agent.")
-    print(f"Got template from {data.get('n_frames')} frames, faces in view: {data.get('faces_in_view')}")
-    if data.get("faces_in_view", 1) > 1:
-        print("WARNING: more than one face in view; the largest face was used.")
-
-    conn = connect()
-    with conn.cursor() as cur:
-        cur.execute("SELECT name FROM customers WHERE customer_id = %s::uuid", (args.customer_id,))
-        row = cur.fetchone()
-        if not row:
-            sys.exit("Customer not found.")
-        cur.execute("SELECT count(*) FROM embeddings WHERE customer_id = %s::uuid", (args.customer_id,))
-        n_old = cur.fetchone()[0]
-        if not args.yes:
-            ans = input(f"Replace {n_old} embedding(s) of '{row[0]}' with the new template? [y/N] ")
-            if ans.strip().lower() != "y":
-                sys.exit("Cancelled.")
-        cur.execute("DELETE FROM embeddings WHERE customer_id = %s::uuid", (args.customer_id,))
-        cur.execute("""INSERT INTO embeddings (embedding_id, customer_id, embedding_vector, model_name,
-                                               is_primary, created_at)
-                       VALUES (gen_random_uuid(), %s::uuid, %s, %s, TRUE, NOW())""",
-                    (args.customer_id, json.dumps(emb), "mobilefacenet"))
-    conn.commit()
-    conn.close()
-    http_json(f"{args.agent}/reload-gallery", "POST")
-    print(f"Re-enrolled '{row[0]}'. Agent gallery reload requested.")
+        print(f"\nPossible duplicate enrollments (cosine >= tau = {tau:.2f}); delete one of each pair in the CRM:")
+        for s, a, b in sorted(dup, reverse=True):
+            print(f"  {s:.3f}  {names[a]} ({a[:8]})  <->  {names[b]} ({b[:8]})")
+    else:
+        print("\nNo duplicate enrollments.")
 
 
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("check")
-    r = sub.add_parser("reenroll")
-    r.add_argument("--customer-id", required=True)
-    r.add_argument("--agent", default="http://localhost:5001")
-    r.add_argument("--yes", action="store_true")
     args = ap.parse_args()
-    {"check": check, "reenroll": reenroll}[args.cmd](args)
+    {"check": check}[args.cmd](args)
 
 
 if __name__ == "__main__":

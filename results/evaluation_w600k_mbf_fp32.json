@@ -359,5 +359,23 @@
       "track_far": 0.0,
       "track_frr": 0.0135
     }
-  ]
+  ],
+  "device_session_rule": {
+    "threshold": 0.4,
+    "margin": 0.08,
+    "vote_ratio": 0.6,
+    "enroll_embeddings": 5,
+    "sessions": 4000,
+    "genuine": {
+      "correct": 0.9985,
+      "wrong": 0.0,
+      "uncertain": 0.0015,
+      "unknown": 0.0
+    },
+    "impostor": {
+      "false_accept": 0.0,
+      "uncertain": 0.129,
+      "unknown": 0.871
+    }
+  }
 }

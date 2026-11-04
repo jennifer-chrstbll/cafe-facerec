@@ -1,216 +1,194 @@
-# Thesis notes: cashier face recognition (for the defense)
+# Thesis notes: face recognition, person tracking and identity association (for the defense)
 
-Covers the face-recognition node of the system (Arduino UNO Q at the cashier). All numbers come
-from `scripts/evaluate.py` on `dataset/` (20 people × 10 aligned photos) unless marked otherwise.
+Numbers come from `scripts/evaluate.py` on `dataset/` (20 people × 10 aligned photos) unless marked
+otherwise. Latency numbers for Bab IV must be measured on the devices (section 7).
 
 ---
 
-## 1. Where this module sits in the system
+## 1. The system in one picture
 
-- **Cafe-area cameras** (Raspberry Pi 5): YOLO11 → ByteTrack → OSNet ReID → anonymous **Track ID**.
-- **Cashier camera** (this repo, Arduino UNO Q): SCRFD → MobileFaceNet → FAISS → **Customer ID**.
-- **Identity association** (CRM backend): links Track ID ↔ Customer ID with
-  S = 0.5·spatial + 0.3·kinematic + 0.2·temporal; below θ = 0.60 the cashier confirms manually.
-- The UNO Q writes `recognition_logs` (every decision) and `visits` (at most one per customer per
-  30 min). The dashboard shows profile, history and top-3 recommendations.
+```
+CASHIER: face webcam ─ Arduino UNO Q        CEILING (~3 m): 1–2 area cameras ─ Raspberry Pi 5
+  SCRFD-0.5G → align → MobileFaceNet          YOLO11n → ByteTrack + OSNet x0_5 → global ID
+  → face vault → FAISS → session decision      → identity association (face → body)
+        │ Customer ID, LAN :8765 (token) ──────────────▶ │
+        └────────────── Supabase ◀────────────────────────┘ ◀── CRM (Vercel): Kasir, Kamera, Perangkat, …
+```
 
-## 2. The models and why they were chosen
+- **UNO Q** (`uno_q/facerec_uno_q.py`): who is at the cashier → `recognition_logs`, opens the visit,
+  sends the Customer ID to the Pi.
+- **Raspberry Pi** (`DEPLOY/RaspberryPi5/cafe_pi.py`): tracks bodies, decides which body owns the
+  recognised face, keeps the name on that body through occlusions and camera changes, and records
+  entry/exit → **visit duration**.
+- **CRM**: everything the staff and owner see and configure, including manual correction.
+
+## 2. Models and why
 
 | Stage | Model | Key facts | Why |
 |---|---|---|---|
-| Face detection | **SCRFD-0.5G** (`det_500m.onnx`, InsightFace) [8] | ~0.5 GFLOPs, 2.5 MB; predicts box + score + **5 landmarks** (eyes, nose, mouth corners) at strides 8/16/32 with 2 anchors per location | Fast on CPU, and the landmarks are needed for alignment (a plain box detector like OpenCV SSD has none) |
-| Face embedding | **MobileFaceNet** (`w600k_mbf.onnx`, InsightFace *buffalo_sc*) [9] | 112×112 RGB in, **512-d** vector out; trained with **ArcFace loss** (additive angular margin) on WebFace600K; 13.6 MB | Designed for mobile CPUs, so it fits the UNO Q latency budget |
-| Matching | **FAISS `IndexFlatIP`** [10] | Exact inner-product search; on L2-normalized vectors, inner product = **cosine similarity** | Exact (not approximate) is correct for a gallery of tens to hundreds of people; ≈0.03 ms per search |
+| Face detection | **SCRFD-0.5G** (`det_500m`, InsightFace) | box + score + **5 landmarks**; input 320×320 | fast on CPU (≈45 ms on the UNO Q at 320 vs 174 ms at 640), landmarks needed for alignment |
+| Face embedding | **MobileFaceNet** (`w600k_mbf`) | 112×112 → 512-d, ArcFace loss, WebFace600K, 13.6 MB | built for mobile CPUs |
+| Matching | **FAISS `IndexFlatIP`** | exact inner product on unit vectors = cosine | exact is right for tens–hundreds of people |
+| Person detection | **YOLO11n** (ONNX, opset 17) | COCO class 0, **letterboxed** 640 input | smallest current YOLO; real-time on the Pi 5 CPU |
+| Tracking | **ByteTrack** + appearance (BoT-SORT-style gating) | two-stage association (high + low scores) | keeps people through partial occlusion; no camera-motion compensation needed (fixed camera) |
+| Re-identification | **OSNet x0_5** (dynamic batch) | 512-d appearance | measured best separation vs x0_25 / AIN x1_0 at this resolution |
 
-**Why cosine similarity:** ArcFace training places identities on a hypersphere and separates them by
-*angle*. Cosine of the angle is exactly what the network was optimised for; Euclidean distance on
-normalised vectors is equivalent (‖a−b‖² = 2 − 2cos θ).
+**Why cosine:** ArcFace separates identities by angle on a hypersphere; cosine is what was optimised
+(‖a−b‖² = 2 − 2cos θ on unit vectors).
 
-**Why not ResNet50 (more accurate)?** A genuine comparison on the same data (FP32, PC):
+**Why not ResNet50:** EER 1.11 % vs 1.89 % but 13× the size and ~13× the latency (174 MB, ~186 ms per
+face on a PC). MobileFaceNet already meets every target.
 
-| Model | EER | TAR@FAR=0.1% | Size | Latency per face (PC) |
-|---|---|---|---|---|
-| MobileFaceNet (deployed) | 1.89% | 97.1% | 13.6 MB | ~14 ms |
-| ArcFace ResNet50 (`w600k_r50`) | 1.11% | 96.1% | 174 MB | ~186 ms |
+**Runtime on the UNO Q: OpenCV DNN, not ONNX Runtime.** The onnxruntime aarch64 wheel stops with
+"Illegal instruction" on the UNO Q (QRB2210, Cortex-A53 without ARMv8.2 dot-product; tested on the
+board, exit code 132). OpenCV DNN gives **identical embeddings** (cosine 1.000000 vs onnxruntime on all
+198 dataset faces). SCRFD is shipped with a fixed 320×320 input (`models/det_500m_320.onnx`) because
+OpenCV 4.x cannot import its dynamic-shape graph.
 
-ResNet50 gains 0.8 percentage points of EER for 13× the size and ~13× the latency. On the UNO Q's
-Cortex-A53 cores that would be well over a second per face. MobileFaceNet already meets every
-target, so a full model comparison isn't needed for this thesis (the novelty is the integration).
-This one table is enough to answer "why MobileFaceNet".
+## 3. Face pipeline, step by step
 
-> The old `results/` 5-model comparison (ArcFace / AdaFace / MagFace / FaceNet ×2) was **not valid**:
-> four of the five "models" silently loaded the same ResNet50 file, and MobileFaceNet wasn't
-> in it. It's in `legacy/`; don't use it in the thesis.
+1. **Capture**: 640×480 MJPEG, a thread keeps only the newest frame (no buffer lag).
+2. **Detect** with SCRFD (letterbox into 320×320, NMS 0.4, score ≥ 0.5).
+3. **Main face**: the largest face; if a second face is almost as large (< 1.3× smaller) the frame is
+   skipped ("several faces equally close").
+4. **Quality** (unusable frames are dropped, the rest get a score 0..1): face width ≥ 10 % of the image,
+   not cut off at the edge, |yaw| ≤ 0.45, brightness 35–235, Laplacian sharpness ≥ 6.
+   Score = 0.45·facing + 0.25·sharpness + 0.15·size + 0.15·exposure.
+5. **Align**: least-squares similarity transform (Umeyama) from the 5 landmarks to the ArcFace
+   112×112 template (= insightface `norm_crop`).
+6. **Embed** with MobileFaceNet, L2-normalise.
+7. **Face vault**: multiply by a secret orthogonal matrix *R* (section 8). Cosine is unchanged.
+8. **Session**: frames of the same face (cosine to the session mean ≥ 0.40) are collected until
+   10 frames or 2.5 s, or the face is gone for 1 s.
+9. **Decision** (one per session):
+   - template = mean of the 3 best-quality frames; FAISS top-1 customer *c* with score *s₁*, best
+     other customer *s₂*;
+   - **known(c)** if *s₁* ≥ τ = 0.40 **and** *s₁* − *s₂* ≥ 0.08 **and** ≥ 60 % of the 5 best frames
+     individually vote *c* (≥ τ);
+   - **unknown** if *s₁* < 0.35; otherwise **not sure** (nothing recorded, next session decides).
+10. **Outputs**: `recognition_logs` (known: at most every 30 s per customer, so the Kasir screen stays
+    current; unknown: at most every 10 s), `get_or_create_visit()`, face event to the Pi.
 
-## 3. The pipeline, step by step
+Why sessions + margin + vote: averaging the best frames removes random errors (blur, motion, a bad
+landmark); the **margin** rejects faces that are close to two customers (look-alikes); the **vote**
+requires the frames to agree. The threshold handles strangers.
 
-1. **Capture.** 640×480 MJPEG from the webcam. A camera thread always keeps only the newest frame,
-   so processing never works on a stale, buffered frame (this was the main "lag" before).
-2. **Detection.** The frame is resized to 320×256 (keeps the 4:3 aspect, multiple of 32) and
-   normalised ((x−127.5)/128, BGR→RGB). SCRFD outputs scores, box distances and landmark offsets
-   relative to anchor centres; boxes with score ≥ 0.5 go through NMS (IoU 0.4).
-3. **Tracking.** Greedy IoU matching (IoU ≥ 0.3) keeps the same **track** for the same face across
-   frames; a track dies after 1 s without a detection. Detection runs every frame (cheap at 320), so
-   the landmarks are always fresh.
-4. **Quality gate.** A face is only recognised if:
-   - its size is ≥ 60 px;
-   - the detector score is ≥ 0.6;
-   - it's roughly frontal: |yaw| ≤ 0.28 (nose offset from the eye midpoint divided by eye distance,
-     ≈ 40° head turn) and pitch ratio between 0.2 and 0.8;
-   - it's sharp: Laplacian variance of the aligned crop ≥ 25.
+## 4. Threshold τ (likely question)
 
-   Bad frames are skipped instead of producing wrong votes.
-5. **Alignment.** A similarity transform (scale, rotation, translation; 4 degrees of freedom) is
-   estimated by least squares (Umeyama) from the 5 detected landmarks to the fixed ArcFace 112×112
-   template, then `warpAffine`. This is the same method as InsightFace's `norm_crop`, which the
-   model was trained with.
-6. **Embedding.** MobileFaceNet produces f ∈ ℝ⁵¹², then f ← f/‖f‖.
-7. **1:N search.** FAISS returns the best gallery vector and its cosine score s.
-8. **Open-set decision.** If s ≥ τ = 0.40 the vote is "customer X", otherwise "unknown". This is
-   what lets the system reject people who never enrolled.
-9. **Temporal voting.** Each track keeps its last **5** single-frame votes. A track becomes
-   **known(X)** when ≥ **3** votes agree on X, or **unknown** when ≥ 3 votes are unknown.
-   Undecided tracks are embedded every frame. Decided tracks are re-checked every 2 s, or
-   immediately if a vote disagrees (catches two people swapping places).
-10. **Logging.** When a track's decision changes: one `recognition_logs` row (customer_id or NULL,
-    similarity score, `model_used = scrfd500m+mobilefacenet`, camera_id, recognized). For a known
-    customer, also one `visits` row, unless the customer already has a visit in the last 30 min.
-    Database work runs in a background thread with a queue and auto-reconnect, so a slow or offline
-    database never freezes the camera.
-
-## 4. Threshold τ: how it was chosen (likely examiner question)
-
-- In **1:1 verification** (two photos, same person?) the EER point is τ = 0.274 (EER 1.89%).
-- At the cashier it's **1:N open-set identification**. A stranger is compared against *every*
-  enrolled person, and it's enough that *one* of them scores above τ. So **FAR grows with gallery
-  size**:
+1:N open-set: a stranger is compared with *everyone*, so FAR grows with the gallery.
 
 | τ | 1 enrolled | 5 | 10 | 15 | 19 enrolled |
 |---|---|---|---|---|---|
-| 0.26 (old value) | 3.6% | 14.5% | 27.6% | 40.9% | **47.8%** |
-| 0.33 | 0.6% | 2.6% | 4.9% | 7.9% | 9.5% |
-| 0.40 (deployed) | 0% | 0% | 0% | 0% | **0%** |
+| 0.26 (old ResNet50 value) | 3.6 % | 14.5 % | 27.6 % | 40.9 % | **47.8 %** |
+| 0.33 | 0.6 % | 2.6 % | 4.9 % | 7.9 % | 9.5 % |
+| 0.40 (deployed) | 0 % | 0 % | 0 % | 0 % | **0 %** |
 
-- The old τ = 0.2579 was the *ResNet50* EER threshold. It was copied into the MobileFaceNet
-  system and would have accepted about half of all strangers as some customer.
-- τ is chosen as the smallest value with open-set FAR ≤ 1% (the proposal target): **0.38** on this
-  data. **0.40** is deployed for margin, because the field test will have 30–50 participants.
-  **Re-run `evaluate.py` with the field-test participants and recalibrate** (proposal step 3).
+Smallest τ with FAR ≤ 1 % on this data: 0.38; **0.40** is deployed for margin. Re-run with the
+field-test participants (`python scripts/evaluate.py`).
 
-## 5. Results on the dataset (offline)
+## 5. Results (offline, `results/evaluation_w600k_mbf_fp32.json`)
 
-Protocol: each person is enrolled with an averaged template of 3 photos (like `/latest-embedding`);
-the other 7 are probes; 10 random splits; 1,400 probes. FAR uses leave-one-person-out, so each
-person acts as an unknown visitor once.
-
-| Metric (τ = 0.40) | Single frame | After 3-of-5 vote | Proposal target |
+| Metric | Single photo (τ 0.40) | **Device rule** (session, margin, vote) | Target |
 |---|---|---|---|
-| Rank-1 accuracy | 100% | – | ≥ 90% ✔ |
-| FAR (stranger accepted) | 0.00% | 0.00% | ≤ 1% ✔ |
-| FRR (customer rejected) | 1.14% | 0.07% | ≤ 10% ✔ |
+| Rank-1 | 100 % | – | ≥ 90 % ✔ |
+| Enrolled customer recognised correctly | 98.9 % | **99.85 %** | – |
+| Wrong customer | 0 % | **0.00 %** | – |
+| FRR | 1.14 % | **0.15 %** (all "not sure", none wrong) | ≤ 10 % ✔ |
+| FAR (stranger accepted) | 0.00 % | **0.00 %** | ≤ 1 % ✔ |
 
-1:1 verification: genuine mean 0.829, impostor mean 0.068, EER 1.89%, TAR@FAR=1% 98.0%,
-TAR@FAR=0.1% 97.1%.
+Device-rule protocol: 5 embeddings enrolled per person (as the device stores), sessions of 3–5 of the
+person's other photos, 10 splits × 20 sessions × 20 people = 4,000 sessions; strangers = same sessions
+with that person removed from the gallery (leave-one-person-out).
+1:1 verification: genuine mean 0.829, impostor mean 0.068, EER 1.89 %, TAR@FAR=0.1 % 97.1 %.
 
-**Be honest about limits:** 20 people, photos captured in one session in good light, already
-aligned. Field numbers (lighting, queues, partial occlusion, people walking) *will* be lower. That
-is exactly what the field test measures.
+End-to-end test on a laptop with the real programs and a Postgres-protocol database (25 + 11 checks,
+all passed): consent enrollment, duplicate refused, unknown face never accepted, recognition → visit →
+face event to the Pi, self-check, live frames, manual assign/unassign, visit kept or removed correctly.
 
-**Voting nuance (good answer if asked):** if frame errors were independent, 3-of-5 voting would cut
-a 2.7% per-frame FAR to ~0.02% (binomial). The simulation only reaches 0.9% at τ = 0.36, because
-errors are *person-dependent*: a stranger who resembles a customer resembles them in every frame.
-Voting removes **random** errors (blur, motion, a bad landmark). The **threshold** handles
-**look-alikes**. The two are complementary.
+**Limits (say them):** 20 people, one session, good light, aligned photos. Field numbers will be
+lower; that is what the field test measures (Log Wajah: the cashier's ✓/✗ is the ground truth).
 
-## 6. Latency (proposal: end-to-end ≤ 3 s)
+## 6. Face → body (identity association, on the Pi)
 
-PC reference: SCRFD@320 ≈ 7 ms, MobileFaceNet ≈ 14–18 ms, FAISS ≈ 0.03 ms, one full recognition
-step ≈ 26 ms. **The thesis must quote numbers measured on the UNO Q**
-(`scripts/benchmark_edge.py --camera`). Expect several times slower on its Cortex-A53 CPU.
-Time to a decision is about 3 recognition frames (the 3 votes) plus network time to Supabase and
-the dashboard refresh, which should still be well inside 3 s.
+For each body *j* in the camera that sees the cashier, at the frame of the face event:
+foot point *p_j* (bottom centre of the box), body height *h_j*,
+*d_j* = |*p_j* − *Q*|/*h_j*, *v_j* = speed/*h_j* (perspective normalisation: thresholds in body
+heights work anywhere in the image, no calibration).
 
-Speed choices to explain:
-- detector input 320 instead of 640 (~2–3× faster);
-- detection every frame but embedding only for undecided faces;
-- newest-frame camera thread with a 1-frame buffer and MJPEG;
-- ONNX Runtime with 4 threads and no busy-spinning;
-- database I/O off the main loop;
-- JPEG encoding only while someone watches the stream.
+- Gate: inside the cashier circle drawn in the CRM, not staff, not carrying another customer.
+- Likelihood *L_j* = exp(−*d_j*²/2σ_d²)·exp(−*v_j*²/2σ_v²), σ_d = 0.25, σ_v = 0.6.
+- Posterior *P_j* = *L_j* / (Σ*L_k* + *L₀*), *L₀* = exp(−2.5²/2): the "customer not visible"
+  hypothesis of probabilistic data association (Bar-Shalom & Fortmann, 1988). Staff and bodies of
+  other customers are excluded from the normaliser because they are known not to be this customer.
+- Bind if *P* ≥ 0.85 and the same body wins **2** face events in a row; else the cashier taps the
+  person on the CRM *Kamera* page.
 
-## 7. INT8 quantization (the proposal says "kuantisasi INT8")
+Worked example: customer at the counter (d ≈ 0.1) with the next one queuing ~0.9 m behind (d ≈ 0.55)
+→ P ≈ 0.88 → bound. Two people within ~0.6 m → ambiguous → asked. Wrong identities cost a customer's
+history; a question costs one tap.
 
-`scripts/quantize_int8.py`: static post-training quantization (ONNX Runtime, QOperator, INT8
-weights / UINT8 activations), calibrated on the dataset, embedding head kept in FP32.
+The proposal's weighted sum S = 0.5·spatial + 0.3·kinematic + 0.2·temporal is the same idea; the
+product-of-Gaussians + normaliser makes it a probability with an explicit "nobody" option and lets the
+decision depend on the *other* people present (a queue), which a fixed θ on S cannot.
+References: Bar-Shalom & Fortmann (1988); Hartley & Zisserman (2003) for foot points; Javed et al.
+(ICCV 2003) for space-time + appearance across cameras; Kuhn (1955) Hungarian assignment (ByteTrack).
 
-| | FP32 | INT8 |
-|---|---|---|
-| EER | 1.89% | 2.89% |
-| Open-set FAR / FRR at τ = 0.40 | 0.00% / 1.14% | 1.79% / 1.43% |
-| Recommended τ | 0.38 | 0.41 |
-| File size | 13.6 MB | 8.1 MB |
-| Speed on PC (x86) | ~18 ms | ~36 ms (slower) |
-| cos(FP32, INT8) same face | – | 0.88 |
+Keeping the name: strict mode re-checks the body's appearance every frame against the appearance at
+binding time and drops the name rather than let it drift to someone else; recovery after an ID split
+needs appearance + position + size consistency; staff areas and "one person, one place" across
+cameras. Manual "Bukan dia" removes a wrong name immediately.
 
-**Conclusion so far:** INT8 costs accuracy and isn't faster on x86. Decide using the **UNO Q
-benchmark** (`benchmark_edge.py --int8 ...`). If it's not clearly faster there, keep FP32 and
-change the proposal/thesis wording to "FP32; INT8 was evaluated and not adopted because…".
-INT8 and FP32 embeddings **can't be mixed**: the whole gallery must be enrolled with the model the
-device runs.
+## 7. Latency (proposal ≤ 3 s) — measure on the devices
 
-## 8. Enrollment and privacy (UU PDP)
+- UNO Q: `python3 benchmark_edge.py` (copied next to `facerec_uno_q.py`) → `results/edge_benchmark_<host>.json`.
+  Board measurements so far: SCRFD@320 ≈ 45 ms. Time to decision = one session (≤ 2.5 s by design) +
+  LAN to the Pi (ms) + Kasir screen refresh (2 s poll).
+- Pi: `scripts/benchmark_edge_performance.py`. Earlier: YOLO11n 640 ≈ 93 ms, OSNet ≈ 13 ms (1 person).
 
-- Enrollment: the cashier asks; the CRM calls `GET /latest-embedding`. The device returns the
-  **average of up to 10 good-quality frames** of the largest face in view (≥ 3 frames, seen within
-  the last 5 s). If that face is already recognised as a customer it returns **409**, which
-  prevents duplicate customer IDs for one person.
-- **Only the 512-d embedding** is stored (Supabase `embeddings`). No image is stored by the device.
-- Unknown faces exist only in RAM, for the life of the track plus 5 s for enrollment. Nothing about
-  them is written except a log row with `customer_id = NULL` and a score.
-- An embedding can't be turned back into a photo, but it is still biometric personal data.
-- Deleting a customer deletes their embeddings (FK `ON DELETE CASCADE`). The device reloads the
-  gallery every 120 s, and 5 s after each enrollment.
+**INT8 (the proposal says "kuantisasi INT8").** Static PTQ (`scripts/quantize_int8.py`): EER 1.89 % →
+2.89 %, open-set FAR at τ 0.40: 0 % → 1.79 %, file 13.6 → 8.1 MB, and *slower* on x86 (18 → 36 ms).
+OpenCV DNN on the UNO Q runs the FP32 model. Wording for the thesis: "FP32 deployed; INT8 was evaluated
+and not adopted because accuracy dropped without a speed gain". INT8 and FP32 embeddings cannot be mixed.
 
-## 9. API on the UNO Q (port 5001)
+## 8. Enrollment and privacy (UU PDP No. 27/2022)
 
-| Endpoint | Use |
-|---|---|
-| `GET /video_feed` | MJPEG live view with boxes: green = known (name + score), orange = unknown, grey = recognizing / quality message |
-| `GET /latest-embedding` | Enrollment template (404 no good face, 409 already registered) |
-| `POST /extract-embedding` | Embedding from an uploaded photo |
-| `POST /recognize` | 1:N result for an uploaded photo |
-| `POST /reload-gallery` | Reload embeddings now |
-| `GET /health` | FPS, timings, gallery size, τ, voting and quality settings |
+- Enrollment **only from the CRM after explicit consent** (18+, checkbox). The old board program
+  enrolled every unknown face automatically ("Pelanggan 0001") — removed: no consent, and it created
+  duplicate identities when a known customer scored just under τ.
+- The UNO Q captures 20 good frames, keeps the 5 best non-duplicates, checks they are one person
+  (each ≥ 0.50 to their mean) and not already enrolled as someone else (≥ τ), stores 5 embeddings.
+- **Face vault (cancelable biometrics, Ratha, Connell & Bolle 2001):** stored vectors are *R·f* with
+  *R* a secret 512×512 orthogonal matrix derived from `VAULT_KEY` (HKDF-SHA256 → SHA-256 stream →
+  Gaussian → QR). Cosine is preserved exactly, so accuracy is unchanged, but the stored numbers are not
+  MobileFaceNet outputs: they cannot be matched with other systems or inverted with public models;
+  changing the key revokes all templates. No photos are stored anywhere.
+- Unknown faces live only in RAM for the session. Live pictures reach the website only while a page
+  is open and are overwritten, never recorded.
+- *Wajah Terdaftar* (owner): list, re-enroll, delete selected / all faces; retention (*Pengaturan →
+  Privasi*); full erasure on the customer profile. Every deletion makes the UNO Q reload its gallery.
 
-## 10. Likely questions
+## 9. Likely questions
 
-- **Why SCRFD and not MTCNN/RetinaFace?** Much faster at similar accuracy on small faces, and it
-  outputs the 5 landmarks needed for alignment in one pass.
-- **Why align?** The model was trained on aligned faces. Without alignment, rotation and scale
-  changes lower genuine scores (the pre-September version of this code had no alignment).
-- **Why FAISS for so few people?** It's exact (`IndexFlatIP`), so results equal brute-force cosine
-  and it scales if the gallery grows; a numpy fallback gives identical results.
-- **What if two customers look alike?** The threshold and voting reduce it. Below the association
-  threshold the cashier confirms manually. `gallery_tool.py check` flags pairs of enrolled
-  customers whose similarity is ≥ τ.
-- **What about twins, masks, heavy occlusion?** Known limitation (roadmap year 2).
-- **What if the internet drops?** Recognition keeps running. Database writes are queued and
-  retried; the gallery stays in memory.
-- **Why 3 of 5?** It's a trade-off between speed (3 frames ≈ well under 1 s) and stability. It's a
-  parameter that can be calibrated on site (`VOTE_WINDOW`, `VOTE_MIN`).
+- **Why SCRFD, not MTCNN/RetinaFace?** Faster at similar accuracy, landmarks in one pass.
+- **Why align?** The model was trained on aligned faces; the old guessed-landmark alignment gave the
+  same face only ~0.26 similarity.
+- **Why sessions instead of single frames?** Customers do not pose; the best frames of ~2 s are much
+  better than any single frame, and the decision is made once, not flickering.
+- **What if two customers look alike?** The margin rule refuses (not sure); `gallery_tool.py check`
+  lists enrolled pairs ≥ τ.
+- **ByteTrack or BoT-SORT?** ByteTrack association with BoT-SORT-style appearance gating; BoT-SORT's
+  camera-motion compensation is unnecessary for fixed cameras and costs CPU.
+- **Why is ReID run every frame?** Strict identity mode checks every frame that the body still looks
+  like the person who was recognised; skipping frames would let a name drift during occlusions.
+- **Internet drops?** Recognition and tracking keep running; visit events wait in the Pi's on-disk
+  outbox and are sent in order later.
 
-## 11. To do before the field test and defense
+## 10. Before the field test
 
-1. **Rotate the Supabase database password now.** It was committed in `.env.uniq`, and the GitHub
-   repo is public. Then purge history: add `.env.uniq` and `legacy/` to the existing
-   `purge_cafe-facerec_history.sh` and run it.
-2. **Re-enroll** every customer enrolled before 2026-09-12 (`gallery_tool.py check`). Those
-   embeddings came from ResNet50 or from un-aligned crops and won't match.
-3. Deploy `uno_q/` to the board, measure `benchmark_edge.py` there, and put those numbers in Bab IV.
-4. CRM integration (done in `cafe-crm`): enrollment now goes through `enrollment_requests`
-   (the UNO Q writes `model_name = 'mobilefacenet'`), consent is an explicit required step,
-   duplicates are refused, and after each confirmed customer the UNO Q calls the CRM's
-   identity-association endpoint. Contract: `cafe-crm/docs/INTEGRATION.md`.
-5. Set `CRM_URL` and `DEVICE_API_KEY` in `uno_q/.env` (same key as in Vercel).
-6. Raw photos: the proposal says raw face images are deleted within 24 h of extraction. Keep
-   `dataset/` for consenting participants' offline evaluation only, and delete it on schedule.
+1. Rotate the Supabase password and purge the public repos' history (see the CRM README).
+2. Run `database/005_devices.sql` in Supabase.
+3. Deploy `DEPLOY/ArduinoUnoQ` and `DEPLOY/RaspberryPi5` (each has a README), back up `VAULT_KEY`.
+4. In the CRM: *Perangkat* → choose cameras, *Cek perangkat*; *Tata Letak Kamera* → cashier point,
+   staff area, door; *Wajah Terdaftar* → re-enroll customers marked "Perlu daftar ulang".
+5. Measure latency on both devices; record ground truth (Log Wajah ✓/✗, stopwatch visit durations).
+6. Raw photos: keep `dataset/` only for consenting participants' evaluation; delete on schedule.

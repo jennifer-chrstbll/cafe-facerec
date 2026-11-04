@@ -1,42 +1,42 @@
 """
-facerec_uno_q.py
-----------------
-Cashier face-recognition agent for the Arduino UNO Q (Linux side) + USB webcam.
-This single file is everything that runs on the device.
+facerec_uno_q.py -- cashier face recognition for the Arduino UNO Q (Linux side) + USB webcam
+=============================================================================================
+Everything that runs on the UNO Q is in this one file.
 
-Pipeline (every camera frame)
-    webcam frame (640x480)
-      -> SCRFD-0.5G            face boxes + 5 landmarks          (det_500m.onnx)
-      -> IoU tracker           same face keeps the same track id across frames
-      -> quality gate          size, pose (yaw/pitch), sharpness, detector score
-      -> 5-point alignment     similarity transform to the 112x112 ArcFace template
-      -> MobileFaceNet         512-d embedding, L2-normalised     (w600k_mbf.onnx)
-      -> FAISS IndexFlatIP     1:N cosine search over the Supabase gallery
-      -> open-set threshold    score >= tau -> "known", else "unknown" vote
-      -> temporal voting       >= VOTE_MIN agreeing votes out of VOTE_WINDOW decide
-      -> Supabase              recognition_logs + visits (background thread)
+Pipeline
+    webcam (640x480, newest frame only)
+      -> SCRFD-0.5G (det_500m)        face box + 5 landmarks, 320x320 input
+      -> quality score                size, head pose, sharpness, brightness (bad frames dropped)
+      -> 5-point similarity alignment  Umeyama, ArcFace 112x112 template (= insightface norm_crop)
+      -> MobileFaceNet (w600k_mbf)     512-d embedding, L2-normalised
+      -> face vault rotation           secret orthogonal matrix: cosine unchanged, raw vector never stored
+      -> FAISS IndexFlatIP             1:N cosine search over the gallery from Supabase
+      -> session decision              ~10 frames of one face (<= 2.5 s): mean of the 3 best frames
+                                       >= tau, margin to the next customer >= m, and >= 60 % of the
+                                       best frames vote for the same customer
+      -> outputs                       recognition_logs + visit (Supabase), face event -> Raspberry Pi
 
-HTTP API (port 5001, used by the CRM)
-    GET  /video_feed          MJPEG stream with overlay
-    GET  /latest-embedding    averaged embedding of the face in front of the camera (enrollment)
-    POST /extract-embedding   embedding from an uploaded photo (multipart field "file" or raw bytes)
-    POST /recognize           1:N recognition of an uploaded photo
-    POST /reload-gallery      reload embeddings from Supabase now
-    GET  /health              status, gallery size, timings, thresholds
+Inference uses OpenCV DNN, not onnxruntime: the onnxruntime wheel stops with
+"Illegal instruction" on the UNO Q's CPU (QRB2210, no ARMv8.2 dot-product).
 
-Run
-    python3 facerec_uno_q.py            # reads .env next to this file
+Faces are enrolled ONLY from the CRM (customer consent first): the CRM writes an
+enrollment_requests row, this program captures the face and stores the embeddings.
+
+Run:  python3 facerec_uno_q.py      (settings in .env next to this file)
 """
 
 from __future__ import annotations
 
+import base64
 import collections
-import email.parser
-import email.policy
+import glob
+import hashlib
+import hmac
 import json
 import logging
 import os
 import queue
+import socket
 import sys
 import threading
 import time
@@ -49,13 +49,12 @@ from typing import Optional
 
 import cv2
 import numpy as np
-import onnxruntime as ort
 
 try:
     import faiss
-    _HAS_FAISS = True
+    HAS_FAISS = True
 except ImportError:
-    _HAS_FAISS = False
+    HAS_FAISS = False
 
 try:
     from dotenv import load_dotenv
@@ -69,7 +68,9 @@ if load_dotenv is not None:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("facerec")
 
-MODEL_TAG = "scrfd500m+mobilefacenet"    # written to recognition_logs.model_used
+VERSION = "2.0.0"
+MODEL_TAG = "scrfd500m+mobilefacenet"   # recognition_logs.model_used
+MODEL_NAME = "mbf-scrfd-v2"             # embeddings.model_name: only these rows are loaded
 EMBED_DIM = 512
 
 
@@ -85,115 +86,168 @@ def _env(name: str, default, cast=str):
 @dataclass
 class Config:
     database_url: str = _env("DATABASE_URL", "")
-    camera_id: str = _env("CAMERA_ID", "uno-q-001")
-    camera_index: int = _env("CAMERA_INDEX", -1, int)          # -1 = auto-detect /dev/video0..4
+    device_id: str = _env("CAMERA_ID", "uno-q-001")         # = CRM Pengaturan > Perangkat > ID kamera kasir
+    camera_source: str = _env("CAMERA_SOURCE", "")           # "" auto | 0 | /dev/v4l/by-id/... | http://...
     frame_w: int = _env("FRAME_WIDTH", 640, int)
     frame_h: int = _env("FRAME_HEIGHT", 480, int)
-    port: int = _env("STREAM_PORT", 5001, int)
+    threads: int = _env("NUM_THREADS", 4, int)
 
-    # Models
-    det_model: str = _env("DET_MODEL_PATH", "")
-    rec_model: str = _env("REC_MODEL_PATH", "")                # point at an INT8 model to use it
-    num_threads: int = _env("NUM_THREADS", os.cpu_count() or 4, int)
-    det_size: int = _env("DET_SIZE", 320, int)                 # SCRFD input width (multiple of 32)
+    det_size: int = _env("DET_SIZE", 320, int)               # 320: 45 ms on the UNO Q, 640: 174 ms
     det_thresh: float = _env("DET_THRESH", 0.50, float)
 
-    # Recognition
-    match_threshold: float = _env("MATCH_THRESHOLD", 0.40, float)   # cosine tau (see scripts/evaluate.py)
-    vote_window: int = _env("VOTE_WINDOW", 5, int)
-    vote_min: int = _env("VOTE_MIN", 3, int)
-    reverify_sec: float = _env("REVERIFY_SEC", 2.0, float)
-    max_embed_per_frame: int = _env("MAX_EMBED_PER_FRAME", 1, int)
-    track_ttl: float = _env("TRACK_TTL", 1.0, float)
+    match_threshold: float = _env("MATCH_THRESHOLD", 0.40, float)
+    match_margin: float = _env("MATCH_MARGIN", 0.08, float)
+    vote_ratio: float = _env("VOTE_RATIO", 0.60, float)
+    session_frames: int = _env("SESSION_FRAMES", 10, int)
+    session_max_sec: float = _env("SESSION_MAX_SEC", 2.5, float)
+    session_min_frames: int = _env("SESSION_MIN_FRAMES", 3, int)
 
-    # Quality gate
-    min_face_px: int = _env("MIN_FACE_PX", 60, int)
-    min_det_score: float = _env("MIN_DET_SCORE", 0.60, float)
-    max_yaw: float = _env("MAX_YAW", 0.28, float)
-    min_sharpness: float = _env("MIN_SHARPNESS", 25.0, float)
+    enroll_frames: int = _env("ENROLL_FRAMES", 20, int)
+    enroll_keep: int = _env("ENROLL_KEEP", 5, int)
+    enroll_timeout: float = _env("ENROLL_TIMEOUT_SEC", 20.0, float)
 
-    # Enrollment
-    enroll_min_frames: int = _env("ENROLL_MIN_FRAMES", 3, int)
-    enroll_max_age: float = _env("ENROLL_MAX_AGE", 5.0, float)
-    allow_duplicate_enroll: bool = _env("ALLOW_DUPLICATE_ENROLL", "0") == "1"
-
-    # Logging to Supabase
-    known_log_cooldown: float = _env("KNOWN_LOG_COOLDOWN", 60.0, float)
+    known_log_cooldown: float = _env("KNOWN_LOG_COOLDOWN", 30.0, float)   # < CRM Kasir window (45 s)
     unknown_log_cooldown: float = _env("UNKNOWN_LOG_COOLDOWN", 10.0, float)
-    visit_cooldown_min: int = _env("VISIT_COOLDOWN_MIN", 30, int)   # re-entry within N min = same visit
-    visit_max_open_hours: int = _env("VISIT_MAX_OPEN_HOURS", 6, int)  # same as CRM settings.visits
-    heartbeat_sec: float = _env("HEARTBEAT_SEC", 30.0, float)
-
-    # CRM (identity association): https://<your-crm>.vercel.app + shared DEVICE_API_KEY
-    crm_url: str = _env("CRM_URL", "")
-    device_api_key: str = _env("DEVICE_API_KEY", "")
+    visit_max_open_hours: int = _env("VISIT_MAX_OPEN_HOURS", 6, int)
+    visit_reopen_min: int = _env("VISIT_REOPEN_MIN", 30, int)
     reload_interval: float = _env("RELOAD_INTERVAL", 120.0, float)
-    gallery_since: str = _env("GALLERY_SINCE", "")              # e.g. 2026-09-12 to skip legacy embeddings
+    heartbeat_sec: float = _env("HEARTBEAT_SEC", 10.0, float)
 
-    # Stream
-    stream_fps: float = _env("STREAM_FPS", 15.0, float)
-    jpeg_quality: int = _env("JPEG_QUALITY", 70, int)
+    pi_face_url: str = _env("PI_FACE_URL", "")               # http://<pi-ip>:8765/wajah
+    face_token: str = _env("FACE_TOKEN", "")                 # same as FACE_TOKEN on the Pi
+    pi_cooldown: float = _env("PI_COOLDOWN", 2.0, float)
+    area_camera: str = _env("AREA_CAMERA_ID", "CAM_1")       # Pi camera that sees the cashier
+
+    vault_key: str = _env("VAULT_KEY", "")                   # 64 hex chars; KEEP A BACKUP
+    local_host: str = _env("STREAM_HOST", "127.0.0.1")       # local preview/health only
+    local_port: int = _env("STREAM_PORT", 5001, int)
 
 
-# Embeddings created before this date came from older pipelines
-# (ResNet50 until early Sep 2026, then MobileFaceNet without alignment).
-PIPELINE_SINCE = "2026-09-12"
+# ── Small helpers ─────────────────────────────────────────────────────────────
+
+def l2n(v: np.ndarray) -> np.ndarray:
+    v = np.asarray(v, dtype=np.float32).reshape(-1)
+    return (v / (np.linalg.norm(v) + 1e-10)).astype(np.float32)
+
+
+def utc_iso(ts: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ts)) + f".{int((ts % 1) * 1000):03d}Z"
+
+
+def list_cameras() -> list[dict]:
+    """Cameras plugged into this board, by stable id (survives replugging)."""
+    out = []
+    for p in sorted(glob.glob("/dev/v4l/by-id/*-video-index0")):
+        name = os.path.basename(p).replace("usb-", "").replace("-video-index0", "").replace("_", " ")
+        out.append({"source": p, "name": name})
+    return out
 
 
 # ── Model files ───────────────────────────────────────────────────────────────
 
 BUFFALO_SC_URL = "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_sc.zip"
-_MODEL_DIRS = [HERE / "models", Path.home() / ".insightface" / "models" / "buffalo_sc"]
+MODEL_DIRS = [HERE / "models", Path.home() / ".insightface" / "models" / "buffalo_sc"]
 
 
-def find_model(filename: str, override: str = "") -> str:
-    """Locate an ONNX file: explicit path -> ./models -> ~/.insightface -> download buffalo_sc."""
-    if override:
-        if not os.path.exists(override):
-            raise FileNotFoundError(f"Model not found: {override}")
-        return override
-    for d in _MODEL_DIRS:
+def find_model(filename: str) -> str:
+    for d in MODEL_DIRS:
         if (d / filename).exists():
             return str(d / filename)
-    target = _MODEL_DIRS[0]
+    target = MODEL_DIRS[0]
     target.mkdir(parents=True, exist_ok=True)
-    zip_path = target / "buffalo_sc.zip"
-    log.info("Downloading buffalo_sc model pack (~15 MB) ...")
-    urllib.request.urlretrieve(BUFFALO_SC_URL, zip_path)
-    with zipfile.ZipFile(zip_path) as z:
-        for member in z.namelist():
-            name = os.path.basename(member)
-            if name.endswith(".onnx"):
-                (target / name).write_bytes(z.read(member))
-    zip_path.unlink(missing_ok=True)
+    log.info("Downloading buffalo_sc (SCRFD-0.5G + MobileFaceNet, ~15 MB) ...")
+    zpath = target / "buffalo_sc.zip"
+    urllib.request.urlretrieve(BUFFALO_SC_URL, zpath)
+    with zipfile.ZipFile(zpath) as z:
+        for m in z.namelist():
+            if m.endswith(".onnx"):
+                (target / os.path.basename(m)).write_bytes(z.read(m))
+    zpath.unlink(missing_ok=True)
+    if not (target / filename).exists():
+        raise FileNotFoundError(filename)
     return str(target / filename)
 
 
-def make_session(path: str, num_threads: int) -> ort.InferenceSession:
-    opts = ort.SessionOptions()
-    opts.intra_op_num_threads = num_threads
-    opts.inter_op_num_threads = 1
-    opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    opts.log_severity_level = 3                                  # silence shape warnings
-    opts.add_session_config_entry("session.intra_op.allow_spinning", "0")  # don't burn idle cores
-    return ort.InferenceSession(path, sess_options=opts, providers=["CPUExecutionProvider"])
+def det_model_path(size: int) -> str:
+    """SCRFD with a FIXED input size (models/det_500m_320.onnx, shipped with this program).
+    The original det_500m.onnx has a dynamic input that OpenCV 4.x cannot import; OpenCV 5
+    can, so the original is the fallback."""
+    fixed = HERE / "models" / f"det_500m_{size}.onnx"
+    if fixed.exists():
+        return str(fixed)
+    return find_model("det_500m.onnx")
+
+
+# ── Face vault (cancelable template) ──────────────────────────────────────────
+
+def _hkdf(key: bytes, info: bytes, length: int = 32) -> bytes:
+    """HKDF-SHA256 (RFC 5869) with an all-zero salt."""
+    prk = hmac.new(b"\x00" * 32, key, hashlib.sha256).digest()
+    out, block, i = b"", b"", 1
+    while len(out) < length:
+        block = hmac.new(prk, block + info + bytes([i]), hashlib.sha256).digest()
+        out += block
+        i += 1
+    return out[:length]
+
+
+class Vault:
+    """
+    Secret orthogonal rotation R of the embedding space (cancelable biometrics,
+    Ratha et al. 2001). Cosine similarity is unchanged, so matching is exactly the
+    same, but the stored vectors are not MobileFaceNet outputs: they cannot be
+    matched against other systems or inverted with public models. Changing the key
+    revokes every stored template at once. R is derived only from SHA-256, so it is
+    identical on every machine and every numpy version.
+    """
+
+    def __init__(self, key_hex: str):
+        key = bytes.fromhex(key_hex)
+        if len(key) != 32:
+            raise ValueError("VAULT_KEY must be 64 hex characters")
+        seed = _hkdf(key, b"facerec/rotation/v2")
+        need = EMBED_DIM * EMBED_DIM
+        stream = bytearray()
+        counter = 0
+        while len(stream) < need * 8:
+            stream += hashlib.sha256(seed + counter.to_bytes(8, "big")).digest()
+            counter += 1
+        u = (np.frombuffer(bytes(stream[:need * 8]), dtype=">u8").astype(np.float64) + 0.5) / 2.0 ** 64
+        u1, u2 = u[: need // 2], u[need // 2:]
+        r = np.sqrt(-2.0 * np.log(u1))
+        g = np.concatenate([r * np.cos(2 * np.pi * u2), r * np.sin(2 * np.pi * u2)]).reshape(EMBED_DIM, EMBED_DIM)
+        q, rr = np.linalg.qr(g)
+        self.R = (q * np.sign(np.diag(rr))).astype(np.float32)
+        self.fingerprint = hashlib.sha256(b"fp" + seed).hexdigest()[:12]
+
+    def protect(self, emb: np.ndarray) -> np.ndarray:
+        return l2n(self.R @ l2n(emb))
+
+
+def load_vault_key(cfg: Config) -> str:
+    if cfg.vault_key:
+        return cfg.vault_key
+    path = HERE / "data" / "vault.key"
+    if path.exists():
+        return path.read_text().strip()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key = os.urandom(32).hex()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(key)
+    log.warning("[Vault] New face vault key created in %s. COPY IT to VAULT_KEY in .env and keep a "
+                "backup: without it every enrolled face must be enrolled again.", path)
+    return key
 
 
 # ── Alignment ─────────────────────────────────────────────────────────────────
 
-# ArcFace 112x112 template: left eye, right eye, nose tip, left mouth, right mouth
-REFERENCE_5PTS = np.array([
-    [38.2946, 51.6963],
-    [73.5318, 51.5014],
-    [56.0252, 71.7366],
-    [41.5493, 92.3655],
-    [70.7299, 92.2041],
-], dtype=np.float32)
+ARC_TEMPLATE = np.array([[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366],
+                         [41.5493, 92.3655], [70.7299, 92.2041]], dtype=np.float32)
 
 
 def similarity_transform(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
-    """Least-squares similarity transform (Umeyama), same as insightface norm_crop."""
+    """Least-squares similarity transform (Umeyama 1991), same as insightface norm_crop."""
     src = src.astype(np.float64)
     dst = dst.astype(np.float64)
     mu_s, mu_d = src.mean(0), dst.mean(0)
@@ -203,361 +257,443 @@ def similarity_transform(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
     d = np.ones(2)
     if np.linalg.det(cov) < 0:
         d[1] = -1
-    r = u @ np.diag(d) @ vt
+    rot = u @ np.diag(d) @ vt
     scale = (s * d).sum() / sc.var(0).sum()
-    t = mu_d - scale * r @ mu_s
-    return np.hstack([scale * r, t[:, None]]).astype(np.float32)
+    t = mu_d - scale * rot @ mu_s
+    return np.hstack([scale * rot, t[:, None]]).astype(np.float32)
 
 
-def align_face(img: np.ndarray, kps: np.ndarray) -> np.ndarray:
-    m = similarity_transform(kps, REFERENCE_5PTS)
-    return cv2.warpAffine(img, m, (112, 112), borderValue=0)
+def align(frame: np.ndarray, kps: np.ndarray) -> np.ndarray:
+    return cv2.warpAffine(frame, similarity_transform(kps, ARC_TEMPLATE), (112, 112), borderValue=0)
 
 
-# ── SCRFD-0.5G detector ───────────────────────────────────────────────────────
+# ── Models (OpenCV DNN) ───────────────────────────────────────────────────────
+
+@dataclass
+class Face:
+    box: np.ndarray          # x1, y1, x2, y2
+    score: float
+    kps: np.ndarray          # 5x2: eye (image left), eye (image right), nose, mouth left, mouth right
+
+    @property
+    def width(self) -> float:
+        return float(self.box[2] - self.box[0])
+
 
 class SCRFD:
-    """InsightFace SCRFD (det_500m.onnx): boxes + 5 landmarks, strides 8/16/32, 2 anchors."""
+    """InsightFace SCRFD-0.5G: strides 8/16/32, 2 anchors per cell, square letterboxed input."""
 
-    def __init__(self, model_path: str, num_threads: int, det_size: int = 320,
-                 conf_thresh: float = 0.5, nms_thresh: float = 0.4):
-        self.session = make_session(model_path, num_threads)
-        self.input_name = self.session.get_inputs()[0].name
-        self.output_names = [o.name for o in self.session.get_outputs()]
-        self.det_size = det_size
-        self.conf_thresh = conf_thresh
-        self.nms_thresh = nms_thresh
-        self.strides = (8, 16, 32)
-        self._anchor_cache: dict = {}
+    STRIDES = (8, 16, 32)
 
-    def _anchors(self, h: int, w: int, stride: int) -> np.ndarray:
-        key = (h, w, stride)
-        if key not in self._anchor_cache:
-            centers = np.stack(np.mgrid[:h, :w][::-1], axis=-1).astype(np.float32)
-            centers = (centers * stride).reshape(-1, 2)
-            self._anchor_cache[key] = np.repeat(centers, 2, axis=0)
-        return self._anchor_cache[key]
+    def __init__(self, path: str, size: int = 320, thresh: float = 0.5, nms: float = 0.4):
+        self.net = cv2.dnn.readNetFromONNX(path)
+        self.names = self.net.getUnconnectedOutLayersNames()
+        self.size, self.thresh, self.nms = size, thresh, nms
+        self._anchors = {}
 
-    def detect(self, img: np.ndarray):
-        """Returns dets (N,5) [x1,y1,x2,y2,score] and kps (N,5,2), sorted by score."""
-        ih, iw = img.shape[:2]
-        # Input keeps the frame's aspect ratio (e.g. 640x480 -> 320x256) instead of a square pad.
-        in_w = self.det_size
-        in_h = int(np.ceil(self.det_size * ih / iw / 32.0) * 32)
-        scale = min(in_w / iw, in_h / ih)
-        nw, nh = int(round(iw * scale)), int(round(ih * scale))
-        canvas = np.zeros((in_h, in_w, 3), dtype=np.uint8)
-        canvas[:nh, :nw] = cv2.resize(img, (nw, nh))
-        blob = cv2.dnn.blobFromImage(canvas, 1.0 / 128.0, (in_w, in_h), (127.5, 127.5, 127.5), swapRB=True)
-        outs = self.session.run(self.output_names, {self.input_name: blob})
+    def _anchor(self, stride: int) -> np.ndarray:
+        if stride not in self._anchors:
+            n = self.size // stride
+            c = np.stack(np.mgrid[:n, :n][::-1], axis=-1).astype(np.float32) * stride
+            self._anchors[stride] = np.repeat(c.reshape(-1, 2), 2, axis=0)
+        return self._anchors[stride]
 
-        scores_l, boxes_l, kps_l = [], [], []
-        for i, stride in enumerate(self.strides):
-            scores = outs[i].reshape(-1)
-            boxes = outs[i + 3].reshape(-1, 4) * stride
-            kps = outs[i + 6].reshape(-1, 10) * stride
-            anchors = self._anchors(in_h // stride, in_w // stride, stride)
-            keep = np.where(scores >= self.conf_thresh)[0]
-            if len(keep) == 0:
+    def _split(self, outs) -> dict:
+        """Map outputs to (stride, kind) by shape, independent of the output order."""
+        by = {}
+        for o in outs:
+            o = o.reshape(-1, o.shape[-1]) if o.ndim > 1 else o.reshape(-1, 1)
+            n, k = o.shape
+            for s in self.STRIDES:
+                if n == (self.size // s) ** 2 * 2:
+                    by[(s, {1: "score", 4: "box", 10: "kps"}[k])] = o
+        return by
+
+    def detect(self, frame: np.ndarray) -> list[Face]:
+        h, w = frame.shape[:2]
+        scale = self.size / max(h, w)
+        small = cv2.resize(frame, (int(round(w * scale)), int(round(h * scale))))
+        canvas = np.zeros((self.size, self.size, 3), np.uint8)
+        canvas[:small.shape[0], :small.shape[1]] = small
+        blob = cv2.dnn.blobFromImage(canvas, 1 / 128.0, (self.size, self.size), (127.5, 127.5, 127.5), swapRB=True)
+        self.net.setInput(blob)
+        by = self._split(self.net.forward(self.names))
+        boxes, scores, kpss = [], [], []
+        for s in self.STRIDES:
+            sc = by[(s, "score")].reshape(-1)
+            keep = np.where(sc >= self.thresh)[0]
+            if not len(keep):
                 continue
-            a = anchors[keep]
-            b = boxes[keep]
-            boxes_l.append(np.stack([a[:, 0] - b[:, 0], a[:, 1] - b[:, 1],
-                                     a[:, 0] + b[:, 2], a[:, 1] + b[:, 3]], axis=-1) / scale)
-            k = kps[keep].reshape(-1, 5, 2)
-            kps_l.append((k + a[:, None, :]) / scale)
-            scores_l.append(scores[keep])
+            c = self._anchor(s)[keep]
+            d = by[(s, "box")][keep] * s
+            k = by[(s, "kps")][keep].reshape(-1, 5, 2) * s + c[:, None, :]
+            boxes.append(np.stack([c[:, 0] - d[:, 0], c[:, 1] - d[:, 1], c[:, 0] + d[:, 2], c[:, 1] + d[:, 3]], 1))
+            kpss.append(k)
+            scores.append(sc[keep])
+        if not boxes:
+            return []
+        boxes = np.concatenate(boxes) / scale
+        kpss = np.concatenate(kpss) / scale
+        scores = np.concatenate(scores)
+        tlwh = [[float(b[0]), float(b[1]), float(b[2] - b[0]), float(b[3] - b[1])] for b in boxes]
+        idx = np.array(cv2.dnn.NMSBoxes(tlwh, scores.tolist(), self.thresh, self.nms), dtype=int).reshape(-1)
+        faces = [Face(boxes[i].astype(np.float32), float(scores[i]), kpss[i].astype(np.float32)) for i in idx]
+        return sorted(faces, key=lambda f: -f.width)
 
-        if not scores_l:
-            return np.empty((0, 5), np.float32), np.empty((0, 5, 2), np.float32)
-
-        scores = np.concatenate(scores_l)
-        boxes = np.concatenate(boxes_l)
-        kps = np.concatenate(kps_l)
-        tlwh = np.column_stack([boxes[:, :2], boxes[:, 2:] - boxes[:, :2]])
-        idx = cv2.dnn.NMSBoxes(tlwh.tolist(), scores.tolist(), self.conf_thresh, self.nms_thresh)
-        idx = np.array(idx, dtype=int).reshape(-1)
-        idx = idx[np.argsort(-scores[idx])]
-        boxes[:, [0, 2]] = boxes[:, [0, 2]].clip(0, iw - 1)
-        boxes[:, [1, 3]] = boxes[:, [1, 3]].clip(0, ih - 1)
-        dets = np.column_stack([boxes[idx], scores[idx]]).astype(np.float32)
-        return dets, kps[idx].astype(np.float32)
-
-
-# ── MobileFaceNet embedder ────────────────────────────────────────────────────
 
 class MobileFaceNet:
-    """InsightFace w600k_mbf.onnx: MobileFaceNet trained with ArcFace loss on WebFace600K."""
+    """InsightFace w600k_mbf: MobileFaceNet trained with ArcFace loss on WebFace600K."""
 
-    def __init__(self, model_path: str, num_threads: int):
-        self.session = make_session(model_path, num_threads)
-        self.input_name = self.session.get_inputs()[0].name
+    def __init__(self, path: str):
+        self.net = cv2.dnn.readNetFromONNX(path)
 
-    def embed(self, aligned_bgr_112: np.ndarray) -> np.ndarray:
-        x = cv2.cvtColor(aligned_bgr_112, cv2.COLOR_BGR2RGB).astype(np.float32)
-        x = ((x - 127.5) / 127.5).transpose(2, 0, 1)[None]
-        feat = self.session.run(None, {self.input_name: x})[0].reshape(-1)
-        return l2_normalize(feat)
+    def embed(self, aligned_bgr: np.ndarray) -> np.ndarray:
+        blob = cv2.dnn.blobFromImage(aligned_bgr, 1 / 127.5, (112, 112), (127.5, 127.5, 127.5), swapRB=True)
+        self.net.setInput(blob)
+        return l2n(self.net.forward())
 
 
-def l2_normalize(v: np.ndarray) -> np.ndarray:
-    return (v / (np.linalg.norm(v) + 1e-10)).astype(np.float32)
+# ── Quality (from the board's titik_wajah.py, unchanged thresholds) ───────────
+
+MIN_WIDTH_REL = 0.10        # face width / image width
+MIN_DET = 0.5
+MAX_YAW = 0.45              # beyond this the face is practically in profile
+MIN_SHARP = 6.0
+BRIGHT = (35.0, 235.0)
+EDGE = 0.01
+MAIN_RATIO = 1.3            # the customer's face must be >= 1.3x wider than the next face
 
 
-# ── Gallery (FAISS cosine search) ─────────────────────────────────────────────
+def quality(frame: np.ndarray, faces: list[Face]) -> tuple[Optional[Face], Optional[float], str]:
+    """(main face, quality 0..1 or None if unusable, reason shown on screen)."""
+    h, w = frame.shape[:2]
+    if not faces:
+        return None, None, "Menunggu wajah"
+    f = faces[0]
+    if len(faces) > 1 and faces[1].width * MAIN_RATIO > f.width:
+        return f, None, "Beberapa wajah sama dekat"
+    x1, y1, x2, y2 = f.box
+    le, re, nose, lm, rm = f.kps
+    eye_d = max(abs(re[0] - le[0]), 1.0)
+    yaw = float((nose[0] - (le[0] + re[0]) / 2) / eye_d)
+    eye_y, mouth_y = (le[1] + re[1]) / 2, (lm[1] + rm[1]) / 2
+    pitch = float((nose[1] - eye_y) / max(mouth_y - eye_y, 1.0))
+    roll = float(np.degrees(np.arctan2(re[1] - le[1], re[0] - le[0])))
+    crop = frame[max(0, int(y1)):min(h, int(y2)), max(0, int(x1)):min(w, int(x2))]
+    if crop.size == 0:
+        return f, None, "Wajah terpotong tepi"
+    gray = cv2.cvtColor(cv2.resize(crop, (160, max(1, int(160 * crop.shape[0] / max(crop.shape[1], 1))))),
+                        cv2.COLOR_BGR2GRAY)
+    sharp = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    bright = float(gray.mean())
+    rel = f.width / w
+    if f.score < MIN_DET:
+        return f, None, "Wajah samar"
+    if x1 < EDGE * w or y1 < EDGE * h or x2 > (1 - EDGE) * w or y2 > (1 - EDGE) * h:
+        return f, None, "Wajah terpotong tepi"
+    if rel < MIN_WIDTH_REL:
+        return f, None, "Terlalu jauh"
+    if abs(yaw) > MAX_YAW:
+        return f, None, "Tampak samping"
+    if not BRIGHT[0] <= bright <= BRIGHT[1]:
+        return f, None, "Terlalu gelap/terang"
+    if sharp < MIN_SHARP:
+        return f, None, "Buram"
+    facing = (max(0.0, 1 - abs(yaw) / MAX_YAW) * max(0.0, 1 - abs(pitch - 0.53) / 0.35)
+              * max(0.0, 1 - abs(roll) / 35))
+    q = (0.45 * facing + 0.25 * min(1.0, sharp / 80) + 0.15 * min(1.0, rel / 0.30)
+         + 0.15 * (1 - min(1.0, abs(bright - 130) / 100)))
+    return f, float(q), ""
+
+
+# ── Gallery ───────────────────────────────────────────────────────────────────
 
 class Gallery:
-    """Enrolled embeddings. Vectors are L2-normalised, so inner product = cosine similarity."""
+    """Enrolled (vault-protected) embeddings; inner product = cosine similarity."""
 
     def __init__(self):
-        self._lock = threading.Lock()
+        self.lock = threading.Lock()
         self.ids: list[str] = []
         self.names: dict[str, str] = {}
-        self.vectors = np.zeros((0, EMBED_DIM), np.float32)
+        self.vecs = np.zeros((0, EMBED_DIM), np.float32)
         self.index = None
+        self.legacy = 0          # customers whose face was enrolled with an older pipeline
 
-    def load(self, rows: list[tuple[str, str, np.ndarray]]):
+    def load(self, rows: list[tuple[str, str, np.ndarray]], legacy: int = 0):
         ids = [r[0] for r in rows]
-        names = {r[0]: r[1] for r in rows}
-        vecs = (np.stack([l2_normalize(r[2]) for r in rows]) if rows
-                else np.zeros((0, EMBED_DIM), np.float32))
+        vecs = np.stack([l2n(r[2]) for r in rows]) if rows else np.zeros((0, EMBED_DIM), np.float32)
         index = None
-        if _HAS_FAISS and len(vecs):
+        if HAS_FAISS and len(vecs):
             index = faiss.IndexFlatIP(EMBED_DIM)
             index.add(vecs)
-        with self._lock:
-            self.ids, self.names, self.vectors, self.index = ids, names, vecs, index
+        with self.lock:
+            self.ids, self.vecs, self.index = ids, vecs, index
+            self.names = {r[0]: r[1] for r in rows}
+            self.legacy = legacy
 
-    def search(self, probe: np.ndarray) -> tuple[Optional[str], float]:
-        """Best-matching customer and its cosine score (top-1 over all enrolled embeddings)."""
-        with self._lock:
+    def top2(self, probe: np.ndarray, exclude: Optional[str] = None) -> tuple[Optional[str], float, float]:
+        """Best customer, its cosine, and the best cosine of any OTHER customer (for the margin)."""
+        with self.lock:
             if not self.ids:
-                return None, 0.0
+                return None, 0.0, 0.0
             if self.index is not None:
-                d, i = self.index.search(probe.reshape(1, -1), 1)
-                return self.ids[int(i[0, 0])], float(d[0, 0])
-            sims = self.vectors @ probe
-            j = int(np.argmax(sims))
-            return self.ids[j], float(sims[j])
+                k = min(len(self.ids), 32)
+                d, i = self.index.search(probe.reshape(1, -1), k)
+                pairs = [(self.ids[int(j)], float(s)) for s, j in zip(d[0], i[0]) if j >= 0]
+            else:
+                sims = self.vecs @ probe
+                order = np.argsort(-sims)[:32]
+                pairs = [(self.ids[int(j)], float(sims[j])) for j in order]
+        best: dict[str, float] = {}
+        for cid, s in pairs:
+            if cid != exclude and s > best.get(cid, -2.0):
+                best[cid] = s
+        if not best:
+            return None, 0.0, 0.0
+        ranked = sorted(best.items(), key=lambda kv: -kv[1])
+        second = ranked[1][1] if len(ranked) > 1 else 0.0
+        return ranked[0][0], ranked[0][1], second
 
-    def name_of(self, customer_id: Optional[str]) -> str:
-        return self.names.get(customer_id, "") if customer_id else ""
+    def name(self, cid: Optional[str]) -> str:
+        return self.names.get(cid, "") if cid else ""
 
     def stats(self) -> dict:
-        with self._lock:
-            return {"n_embeddings": len(self.ids), "n_customers": len(set(self.ids)),
-                    "backend": "faiss.IndexFlatIP" if self.index is not None else "numpy"}
+        with self.lock:
+            return {"embeddings": len(self.ids), "customers": len(set(self.ids)), "legacy": self.legacy,
+                    "backend": "faiss" if self.index is not None else "numpy"}
 
 
-# ── Quality gate ──────────────────────────────────────────────────────────────
+# ── Session: collect one face for a few frames, decide once ───────────────────
 
-def pose_and_size(kps: np.ndarray, bbox: np.ndarray) -> tuple[float, float, float]:
-    """Yaw proxy (nose offset / eye distance; 0 = frontal), pitch proxy (~0.5 frontal), face size px."""
-    le, re, nose, lm, rm = kps
-    eye_mid = (le + re) / 2
-    mouth_mid = (lm + rm) / 2
-    eye_dist = max(np.linalg.norm(re - le), 1e-3)
-    yaw = float((nose[0] - eye_mid[0]) / eye_dist)
-    pitch = float((nose[1] - eye_mid[1]) / max(mouth_mid[1] - eye_mid[1], 1e-3))
-    size = float(min(bbox[2] - bbox[0], bbox[3] - bbox[1]))
-    return yaw, pitch, size
+@dataclass
+class Sample:
+    q: float
+    emb: np.ndarray          # vault-protected
 
 
-def sharpness(aligned: np.ndarray) -> float:
-    return float(cv2.Laplacian(cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var())
+class Session:
+    def __init__(self):
+        self.samples: list[Sample] = []
+        self.t0 = 0.0
+        self.t_last = 0.0
 
+    def mean(self) -> np.ndarray:
+        return l2n(np.mean([s.emb for s in self.samples], axis=0))
 
-def check_quality(cfg: Config, det: np.ndarray, kps: np.ndarray,
-                  aligned: Optional[np.ndarray] = None) -> Optional[str]:
-    """None if the face is good enough to recognise, else a short reason shown on screen."""
-    yaw, pitch, size = pose_and_size(kps, det[:4])
-    if size < cfg.min_face_px:
-        return "move closer"
-    if det[4] < cfg.min_det_score:
-        return "low det score"
-    if abs(yaw) > cfg.max_yaw or not (0.2 <= pitch <= 0.8):
-        return "face the camera"
-    if aligned is not None and sharpness(aligned) < cfg.min_sharpness:
-        return "blurry"
-    return None
-
-
-# ── Tracking + temporal voting ────────────────────────────────────────────────
-
-def iou(a: np.ndarray, b: np.ndarray) -> float:
-    x1, y1 = max(a[0], b[0]), max(a[1], b[1])
-    x2, y2 = min(a[2], b[2]), min(a[3], b[3])
-    inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
-    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
-    return inter / union if union > 0 else 0.0
+    def best(self, k: int) -> list[Sample]:
+        """k highest-quality, mutually non-duplicate samples."""
+        out: list[Sample] = []
+        for s in sorted(self.samples, key=lambda s: -s.q):
+            if all(float(s.emb @ o.emb) < 0.985 for o in out):
+                out.append(s)
+            if len(out) >= k:
+                break
+        return out
 
 
 @dataclass
-class Track:
-    track_id: int
-    bbox: np.ndarray
-    kps: np.ndarray
-    det_score: float
-    first_seen: float
-    last_seen: float
-    votes: collections.deque = field(default_factory=collections.deque)
-    samples: collections.deque = field(default_factory=collections.deque)  # good embeddings (RAM only)
-    state: str = "pending"            # pending | known | unknown
-    customer_id: Optional[str] = None
-    score: float = 0.0
-    last_embed: float = 0.0
-    quality_msg: Optional[str] = None
-    logged_state: Optional[tuple] = None
+class Decision:
+    state: str                     # known | unknown | uncertain
+    customer_id: Optional[str]
+    score: float
+    margin: float
+    votes: str
+    n: int
+    t: float = field(default_factory=time.time)
 
 
-class FaceTracker:
-    """Greedy IoU tracker. A track is one face standing in front of the camera."""
+def decide(cfg: Config, gallery: Gallery, sess: Session) -> Decision:
+    best = sess.best(5)
+    template = l2n(np.mean([s.emb for s in best[:3]], axis=0))
+    cid, s1, s2 = gallery.top2(template)
+    votes = 0
+    for s in best:
+        c, v, _ = gallery.top2(s.emb)
+        votes += int(c == cid and v >= cfg.match_threshold)
+    need = int(np.ceil(cfg.vote_ratio * len(best)))
+    vote_txt = f"{votes}/{len(best)}"
+    if cid is not None and s1 >= cfg.match_threshold and s1 - s2 >= cfg.match_margin and votes >= need:
+        return Decision("known", cid, s1, s1 - s2, vote_txt, len(sess.samples))
+    if cid is None or s1 < cfg.match_threshold - 0.05:
+        return Decision("unknown", None, s1, s1 - s2, vote_txt, len(sess.samples))
+    return Decision("uncertain", None, s1, s1 - s2, vote_txt, len(sess.samples))
 
+
+# ── Camera (newest frame only) ────────────────────────────────────────────────
+
+class Camera(threading.Thread):
     def __init__(self, cfg: Config):
+        super().__init__(daemon=True, name="camera")
         self.cfg = cfg
-        self.tracks: dict[int, Track] = {}
-        self._next_id = 1
+        self.source = cfg.camera_source
+        self.cap = None
+        self.cond = threading.Condition()
+        self.frame = None
+        self.seq = 0
+        self.ok = False
+        self.size = (0, 0)
+        self.is_file = False
+        self.file_fps = 0.0
+        self._switch = threading.Event()
 
-    def update(self, dets: np.ndarray, kps: np.ndarray, now: float) -> list[Track]:
-        # Drop stale tracks first so a new person at the same spot never inherits an old identity.
-        for tid in [tid for tid, t in self.tracks.items() if now - t.last_seen > self.cfg.track_ttl]:
-            del self.tracks[tid]
-        pairs = sorted(((iou(t.bbox, d[:4]), tid, j)
-                        for tid, t in self.tracks.items() for j, d in enumerate(dets)), reverse=True)
-        used_t, used_d, updated = set(), set(), []
-        for overlap, tid, j in pairs:
-            if overlap < 0.3:
-                break
-            if tid in used_t or j in used_d:
+    def switch(self, source: str):
+        if source != self.source:
+            log.info("[Camera] switching to %s", source or "auto")
+            self.source = source
+            self._switch.set()
+
+    def _open(self) -> bool:
+        src = self.source
+        candidates: list = []
+        if src == "":
+            candidates = [c["source"] for c in list_cameras()] or list(range(5))
+        elif src.isdigit():
+            candidates = [int(src)]
+        else:
+            candidates = [src]
+        for c in candidates:
+            is_url = isinstance(c, str) and "://" in c
+            is_file = isinstance(c, str) and not is_url and os.path.isfile(c)   # recorded video (rehearsal)
+            if is_url:
+                cap = cv2.VideoCapture(c, cv2.CAP_FFMPEG)
+            elif is_file:
+                cap = cv2.VideoCapture(c)
+            elif sys.platform.startswith("linux"):
+                cap = cv2.VideoCapture(c, cv2.CAP_V4L2)
+            else:
+                cap = cv2.VideoCapture(c)
+            if not cap.isOpened():
+                cap.release()
                 continue
-            t = self.tracks[tid]
-            t.bbox, t.kps, t.det_score, t.last_seen = dets[j][:4].copy(), kps[j].copy(), float(dets[j][4]), now
-            used_t.add(tid)
-            used_d.add(j)
-            updated.append(t)
-        for j, d in enumerate(dets):
-            if j in used_d:
+            self.is_file = is_file
+            self.file_fps = (cap.get(cv2.CAP_PROP_FPS) or 15.0) if is_file else 0.0
+            if not (is_url or is_file):
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.cfg.frame_w)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.cfg.frame_h)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            ok, fr = cap.read()
+            if ok and fr is not None:
+                self.cap, self.ok, self.size = cap, True, (fr.shape[1], fr.shape[0])
+                self.opened = str(c)
+                log.info("[Camera] %s opened at %dx%d", c, fr.shape[1], fr.shape[0])
+                return True
+            cap.release()
+        return False
+
+    def run(self):
+        fails = 0
+        while True:
+            if self._switch.is_set():
+                self._switch.clear()
+                if self.cap is not None:
+                    self.cap.release()
+                self.cap, self.ok = None, False
+            if self.cap is None and not self._open():
+                self.ok = False
+                log.error("[Camera] no webcam (%s), retrying in 3 s", self.source or "auto")
+                time.sleep(3)
                 continue
-            t = Track(self._next_id, d[:4].copy(), kps[j].copy(), float(d[4]), now, now,
-                      collections.deque(maxlen=self.cfg.vote_window),
-                      collections.deque(maxlen=10))
-            self.tracks[t.track_id] = t
-            self._next_id += 1
-            updated.append(t)
-        return updated
-
-
-def decide(track: Track, cfg: Config) -> tuple[str, Optional[str], float]:
-    """Majority vote over the last VOTE_WINDOW single-frame results of one track."""
-    counts = collections.Counter(cid for cid, _ in track.votes)
-    best, n_best = None, 0
-    for cid, n in counts.items():
-        if cid is not None and n > n_best:
-            best, n_best = cid, n
-    if best is not None and n_best >= cfg.vote_min:
-        return "known", best, float(np.mean([s for c, s in track.votes if c == best]))
-    if counts.get(None, 0) >= cfg.vote_min:
-        return "unknown", None, float(np.mean([s for c, s in track.votes if c is None]))
-    return "pending", None, 0.0
-
-
-# ── Recognition engine ────────────────────────────────────────────────────────
-
-class FaceEngine:
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-        cv2.setNumThreads(1)  # leave the cores to ONNX Runtime
-        self.detector = SCRFD(find_model("det_500m.onnx", cfg.det_model), cfg.num_threads,
-                              cfg.det_size, cfg.det_thresh)
-        self.embedder = MobileFaceNet(find_model("w600k_mbf.onnx", cfg.rec_model), cfg.num_threads)
-        self.gallery = Gallery()
-        self.tracker = FaceTracker(cfg)
-        self.timing = {"det_ms": 0.0, "emb_ms": 0.0, "frame_ms": 0.0}
-
-    def _ema(self, key: str, value: float):
-        self.timing[key] = value if self.timing[key] == 0 else 0.9 * self.timing[key] + 0.1 * value
-
-    def match(self, emb: np.ndarray) -> tuple[Optional[str], float]:
-        """Open-set decision for one embedding: (customer_id or None, cosine score)."""
-        cid, score = self.gallery.search(emb)
-        return (cid if cid is not None and score >= self.cfg.match_threshold else None), score
-
-    def process(self, frame: np.ndarray, now: float) -> tuple[list[Track], list[Track]]:
-        """Run one frame. Returns (visible tracks, tracks whose decision just changed)."""
-        t0 = time.perf_counter()
-        dets, kps = self.detector.detect(frame)
-        self._ema("det_ms", (time.perf_counter() - t0) * 1000)
-        visible = self.tracker.update(dets, kps, now)
-
-        # Embed the faces that need it most: undecided first, then largest.
-        def priority(t: Track):
-            return (t.state != "pending", -(t.bbox[2] - t.bbox[0]))
-        budget = self.cfg.max_embed_per_frame
-        changed = []
-        for t in sorted(visible, key=priority):
-            # Re-check every frame while undecided or when the last vote disagreed
-            # (e.g. two people swapped places), otherwise only every REVERIFY_SEC.
-            disagrees = bool(t.votes) and t.votes[-1][0] != t.customer_id
-            due = t.state == "pending" or disagrees or now - t.last_embed >= self.cfg.reverify_sec
-            t.quality_msg = check_quality(self.cfg, np.append(t.bbox, t.det_score), t.kps)
-            if budget <= 0 or not due or t.quality_msg:
+            ok, fr = self.cap.read()
+            if (not ok or fr is None) and getattr(self, "is_file", False):
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)          # loop the recording
                 continue
-            aligned = align_face(frame, t.kps)
-            if sharpness(aligned) < self.cfg.min_sharpness:
-                t.quality_msg = "blurry"
+            if getattr(self, "is_file", False):
+                time.sleep(1.0 / max(self.file_fps, 1.0))          # play at its own speed
+            if not ok or fr is None:
+                fails += 1
+                if fails > 30:
+                    log.warning("[Camera] lost, reopening")
+                    self.cap.release()
+                    self.cap, self.ok, fails = None, False, 0
+                time.sleep(0.01)
                 continue
-            t1 = time.perf_counter()
-            emb = self.embedder.embed(aligned)
-            self._ema("emb_ms", (time.perf_counter() - t1) * 1000)
-            budget -= 1
-            t.last_embed = now
-            t.samples.append(emb)
-            t.votes.append(self.match(emb))
-            state, cid, score = decide(t, self.cfg)
-            if state != "pending":
-                if (state, cid) != (t.state, t.customer_id):
-                    changed.append(t)
-                t.state, t.customer_id, t.score = state, cid, score
-        self._ema("frame_ms", (time.perf_counter() - t0) * 1000)
-        return visible, changed
+            fails = 0
+            with self.cond:
+                self.frame, self.seq = fr, self.seq + 1
+                self.cond.notify_all()
 
-    def embed_image(self, img: np.ndarray) -> dict:
-        """Stateless: largest good face in a still image -> embedding (for uploads)."""
-        dets, kps = self.detector.detect(img)
-        if len(dets) == 0:
-            return {"ok": False, "message": "No face detected in the image."}
-        j = int(np.argmax((dets[:, 2] - dets[:, 0]) * (dets[:, 3] - dets[:, 1])))
-        aligned = align_face(img, kps[j])
-        reason = check_quality(self.cfg, dets[j], kps[j], aligned)
-        if reason:
-            return {"ok": False, "message": f"Face quality too low: {reason}."}
-        return {"ok": True, "embedding": self.embedder.embed(aligned), "det_score": float(dets[j][4]),
-                "bbox": [int(v) for v in dets[j][:4]]}
+    def latest(self, after: int, timeout: float = 1.0):
+        with self.cond:
+            self.cond.wait_for(lambda: self.seq > after, timeout=timeout)
+            return self.frame, self.seq
 
 
-# ── Supabase worker (all network I/O off the camera loop) ─────────────────────
+# ── Shared state ──────────────────────────────────────────────────────────────
 
-def parse_vector(v) -> np.ndarray:
+class State:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.fps = 0.0
+        self.det_ms = 0.0
+        self.emb_ms = 0.0
+        self.last_decision: Optional[Decision] = None
+        self.view: dict = {}               # what is on screen right now (for the overlay)
+        self.preview: Optional[np.ndarray] = None
+        self.enroll: Optional[dict] = None  # active enrollment request
+        self.pi_ok: Optional[bool] = None
+        self.started = time.time()
+
+
+# ── Raspberry Pi link (face event -> body at the cashier) ─────────────────────
+
+class PiLink(threading.Thread):
+    def __init__(self, cfg: Config, state: State):
+        super().__init__(daemon=True, name="pi")
+        self.cfg, self.state = cfg, state
+        self.q: queue.Queue = queue.Queue(maxsize=20)
+        self.last: dict[str, float] = {}
+
+    def send(self, cid: str, score: float, name: str):
+        now = time.time()
+        if now - self.last.get(cid, 0.0) < self.cfg.pi_cooldown:
+            return
+        self.last[cid] = now
+        try:
+            self.q.put_nowait({"customer_id": cid, "score": round(float(score), 4), "label": name[:40],
+                               "camera_id": self.cfg.area_camera, "zone_id": "TITIK_KASIR",
+                               "face_camera": self.cfg.device_id})
+        except queue.Full:
+            pass
+
+    def run(self):
+        while True:
+            body = json.dumps(self.q.get()).encode()
+            headers = {"Content-Type": "application/json"}
+            if self.cfg.face_token:
+                headers["X-Auth-Token"] = self.cfg.face_token
+            req = urllib.request.Request(self.cfg.pi_face_url, data=body, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=2) as r:
+                    r.read()
+                self.state.pi_ok = True
+            except Exception as e:
+                self.state.pi_ok = False
+                log.warning("[Pi] %s unreachable: %s", self.cfg.pi_face_url, e)
+
+
+# ── Database thread (all network I/O off the camera loop) ─────────────────────
+
+def parse_vec(v) -> np.ndarray:
     if isinstance(v, str):
         v = json.loads(v) if v.strip().startswith("[") else [float(x) for x in v.split(",")]
     return np.asarray(v, dtype=np.float32)
 
 
 class Database(threading.Thread):
-    def __init__(self, cfg: Config, gallery: Gallery):
+    def __init__(self, cfg: Config, gallery: Gallery, state: State, camera: Camera, engine: "Engine"):
         super().__init__(daemon=True, name="db")
-        self.cfg = cfg
-        self.gallery = gallery
+        self.cfg, self.gallery, self.state, self.camera, self.engine = cfg, gallery, state, camera, engine
         self.jobs: queue.Queue = queue.Queue(maxsize=500)
         self.conn = None
         self.online = False
-        self.gallery_loaded = threading.Event()
-        self._reload_at = 0.0
-        self._next_enroll_poll = 0.0
-        self._next_heartbeat = 0.0
-        self._optional_off: set = set()   # features whose table is missing (migration 004 not run)
-        self.enroll_fn = None             # () -> current enrollment template dict or None
-        self.status_fn = None             # () -> dict for device_status.info
+        self.loaded = threading.Event()
+        self.reload_at = 0.0
+        self.next = collections.defaultdict(float)
+        self.off: set = set()              # optional features whose migration is missing
+        self.has_visit_fn = True
+        self.sources_seen = None
+        self.restart_requested = False
 
     def submit(self, kind: str, **kw):
         try:
@@ -565,156 +701,267 @@ class Database(threading.Thread):
         except queue.Full:
             log.warning("[DB] queue full, dropping %s", kind)
 
-    def request_reload(self, delay: float = 0.0):
-        self._reload_at = time.time() + delay
-
+    # connection
     def _connect(self):
         import psycopg2
-        self.conn = psycopg2.connect(self.cfg.database_url, connect_timeout=10)
+        self.conn = psycopg2.connect(self.cfg.database_url, connect_timeout=10,
+                                     keepalives=1, keepalives_idle=30, keepalives_interval=10)
         self.conn.autocommit = True
         self.online = True
-        log.info("[DB] Connected to Supabase")
+        log.info("[DB] connected")
 
-    def _load_gallery(self):
-        sql = """SELECT e.customer_id::text, c.name, e.embedding_vector::text, e.created_at
-                 FROM embeddings e JOIN customers c ON c.customer_id = e.customer_id
-                 WHERE c.is_active = TRUE"""
-        params = ()
-        if self.cfg.gallery_since:
-            sql += " AND e.created_at >= %s"
-            params = (self.cfg.gallery_since,)
+    def _q(self, sql: str, params=(), fetch: str = ""):
         with self.conn.cursor() as cur:
             cur.execute(sql, params)
-            rows = cur.fetchall()
-        good, legacy = [], 0
-        for cid, name, vec, created in rows:
-            v = parse_vector(vec)
-            if v.shape != (EMBED_DIM,):
-                continue
-            if created is not None and str(created)[:10] < PIPELINE_SINCE:
-                legacy += 1
-            good.append((cid, name or "", v))
-        self.gallery.load(good)
-        self.gallery_loaded.set()
-        s = self.gallery.stats()
-        log.info("[Gallery] %d embeddings / %d customers (%s)", s["n_embeddings"], s["n_customers"], s["backend"])
-        if legacy:
-            log.warning("[Gallery] %d embeddings were enrolled before %s with an older model/pipeline. "
-                        "They will not match MobileFaceNet reliably: re-enroll those customers "
-                        "(scripts/gallery_tool.py check).", legacy, PIPELINE_SINCE)
-
-    def _execute(self, kind: str, kw: dict):
-        with self.conn.cursor() as cur:
-            if kind == "log":
-                cur.execute("""INSERT INTO recognition_logs
-                                   (customer_id, similarity_score, model_used, camera_id, recognized)
-                               VALUES (%s, %s, %s, %s, %s)""",
-                            (kw["customer_id"], round(kw["score"], 6), MODEL_TAG,
-                             self.cfg.camera_id, kw["customer_id"] is not None))
-            elif kind == "visit":
-                # Same rule as the CRM: open a visit only if the customer has no active one
-                # (open and < VISIT_MAX_OPEN_HOURS old) and did not leave in the last VISIT_COOLDOWN_MIN.
-                cur.execute("""INSERT INTO visits (customer_id, entry_time)
-                               SELECT %s::uuid, NOW()
-                               WHERE NOT EXISTS (
-                                   SELECT 1 FROM visits WHERE customer_id = %s::uuid AND (
-                                       (exit_time IS NULL AND entry_time > NOW() - make_interval(hours => %s))
-                                       OR exit_time > NOW() - make_interval(mins => %s)))""",
-                            (kw["customer_id"], kw["customer_id"], self.cfg.visit_max_open_hours,
-                             self.cfg.visit_cooldown_min))
+            if fetch == "one":
+                return cur.fetchone()
+            if fetch == "all":
+                return cur.fetchall()
+            return cur.rowcount
 
     def _optional(self, name: str, fn):
-        """Run a feature that needs migration 004; switch it off (once) if its table is missing."""
-        if name in self._optional_off:
+        if name in self.off:
             return
         try:
             fn()
         except Exception as e:
-            if "does not exist" in str(e):
-                self._optional_off.add(name)
-                log.warning("[DB] %s disabled: %s (run cafe-crm/database/004_integration.sql)",
-                            name, str(e).splitlines()[0])
+            msg = str(e)
+            if "does not exist" in msg:
+                self.off.add(name)
+                log.warning("[DB] %s disabled: %s (run the CRM database migrations 004/005)",
+                            name, msg.splitlines()[0])
             else:
                 raise
 
+    # gallery
+    def load_gallery(self):
+        rows = self._q("""SELECT e.customer_id::text, c.name, e.embedding_vector::text
+                          FROM embeddings e JOIN customers c ON c.customer_id = e.customer_id
+                          WHERE c.is_active = TRUE AND e.model_name = %s""", (MODEL_NAME,), "all")
+        legacy = self._q("""SELECT COUNT(DISTINCT e.customer_id) FROM embeddings e
+                            JOIN customers c ON c.customer_id = e.customer_id
+                            WHERE c.is_active = TRUE AND e.model_name <> %s
+                              AND NOT EXISTS (SELECT 1 FROM embeddings n WHERE n.customer_id = e.customer_id
+                                              AND n.model_name = %s)""", (MODEL_NAME, MODEL_NAME), "one")[0]
+        good = []
+        for cid, name, vec in rows:
+            v = parse_vec(vec)
+            if v.shape == (EMBED_DIM,):
+                good.append((cid, name or "", v))
+        self.gallery.load(good, int(legacy or 0))
+        self.loaded.set()
+        st = self.gallery.stats()
+        log.info("[Gallery] %d customers (%d embeddings, %s)%s", st["customers"], st["embeddings"],
+                 st["backend"], f"; {st['legacy']} need re-enrollment (old pipeline)" if st["legacy"] else "")
+
+    # jobs from the camera loop
+    def _run_job(self, kind: str, kw: dict):
+        if kind == "log":
+            self._q("""INSERT INTO recognition_logs (customer_id, similarity_score, model_used, camera_id, recognized)
+                       VALUES (%s, %s, %s, %s, %s)""",
+                    (kw["customer_id"], round(float(kw["score"]), 6), MODEL_TAG, self.cfg.device_id,
+                     kw["customer_id"] is not None))
+        elif kind == "visit":
+            cid = kw["customer_id"]
+            if self.has_visit_fn:
+                try:
+                    self._q("SELECT get_or_create_visit(%s::uuid, %s, %s, NOW())",
+                            (cid, self.cfg.visit_max_open_hours, self.cfg.visit_reopen_min))
+                    return
+                except Exception as e:
+                    if "get_or_create_visit" not in str(e):
+                        raise
+                    self.has_visit_fn = False
+                    log.warning("[DB] get_or_create_visit() missing: run database/005_devices.sql")
+            self._q("""INSERT INTO visits (customer_id, entry_time) SELECT %s::uuid, NOW()
+                       WHERE NOT EXISTS (SELECT 1 FROM visits WHERE customer_id = %s::uuid AND (
+                           (exit_time IS NULL AND entry_time > NOW() - make_interval(hours => %s))
+                           OR exit_time > NOW() - make_interval(mins => %s)))""",
+                    (cid, cid, self.cfg.visit_max_open_hours, self.cfg.visit_reopen_min))
+        elif kind == "enroll_done":
+            self._finish_enroll(**kw)
+
+    # enrollment (CRM -> board)
+    def _poll_enroll(self):
+        if self.state.enroll is not None:
+            return
+        row = self._q("""UPDATE enrollment_requests SET status = 'RUNNING'
+                         WHERE request_id = (SELECT request_id FROM enrollment_requests
+                                             WHERE camera_id = %s AND status = 'PENDING'
+                                               AND created_at > NOW() - INTERVAL '25 seconds'
+                                             ORDER BY created_at LIMIT 1)
+                           AND status = 'PENDING'
+                         RETURNING request_id::text, customer_id::text""", (self.cfg.device_id,), "one")
+        if row:
+            log.info("[Enroll] request %s for customer %s", row[0][:8], row[1][:8])
+            self.engine.start_enroll(row[0], row[1])
+
+    def _finish_enroll(self, request_id: str, customer_id: str, ok: bool, message: str, embs=None):
+        if ok:
+            with self.conn.cursor() as cur:
+                cur.execute("BEGIN")
+                try:
+                    cur.execute("DELETE FROM embeddings WHERE customer_id = %s::uuid", (customer_id,))
+                    for i, e in enumerate(embs):
+                        cur.execute("""INSERT INTO embeddings (customer_id, embedding_vector, model_name, is_primary)
+                                       VALUES (%s::uuid, %s, %s, %s)""",
+                                    (customer_id, "[" + ",".join(f"{x:.7f}" for x in e) + "]", MODEL_NAME, i == 0))
+                    cur.execute("""UPDATE enrollment_requests SET status = 'DONE', message = 'OK', n_frames = %s,
+                                   completed_at = NOW() WHERE request_id = %s::uuid""", (len(embs), request_id))
+                    cur.execute("COMMIT")
+                except Exception:
+                    cur.execute("ROLLBACK")
+                    raise
+            log.info("[Enroll] customer %s enrolled (%d embeddings)", customer_id[:8], len(embs))
+            self.reload_at = 0.0
+        else:
+            self._q("""UPDATE enrollment_requests SET status = 'FAILED', message = %s, completed_at = NOW()
+                       WHERE request_id = %s::uuid AND status IN ('PENDING', 'RUNNING')""", (message, request_id))
+            log.info("[Enroll] failed: %s", message)
+
+    # device management
     def _heartbeat(self):
-        info = self.status_fn() if self.status_fn else {}
-        info["gallery"] = self.gallery.stats()["n_customers"]
-        with self.conn.cursor() as cur:
-            cur.execute("""INSERT INTO device_status (device_id, kind, last_seen_at, info)
-                           VALUES (%s, 'facerec', NOW(), %s::jsonb)
-                           ON CONFLICT (device_id) DO UPDATE SET last_seen_at = NOW(), info = EXCLUDED.info""",
-                        (self.cfg.camera_id, json.dumps(info)))
+        st, cam = self.state, self.camera
+        d = st.last_decision
+        info = {
+            "version": VERSION, "model": MODEL_TAG, "fps": round(st.fps, 1),
+            "timing_ms": {"detect": round(st.det_ms, 1), "embed": round(st.emb_ms, 1)},
+            "gallery": self.gallery.stats(), "threshold": self.cfg.match_threshold,
+            "margin": self.cfg.match_margin,
+            "camera": {"ok": cam.ok, "source": getattr(cam, "opened", cam.source) if cam.ok else cam.source,
+                       "width": cam.size[0], "height": cam.size[1]},
+            "cameras": [{**c, "role": "face"} for c in list_cameras()],
+            "roles": ["face"],
+            "pi": {"url": self.cfg.pi_face_url, "ok": st.pi_ok},
+            "uptime_s": int(time.time() - st.started),
+            "last_decision": None if d is None else {"state": d.state, "score": round(d.score, 3),
+                                                     "at": utc_iso(d.t)},
+        }
+        self._q("""INSERT INTO device_status (device_id, kind, last_seen_at, info) VALUES (%s, 'facerec', NOW(), %s::jsonb)
+                   ON CONFLICT (device_id) DO UPDATE SET kind = 'facerec', last_seen_at = NOW(), info = EXCLUDED.info""",
+                (self.cfg.device_id, json.dumps(info)))
 
-    def _poll_enrollment(self):
-        """Serve one PENDING enrollment request from the CRM with the face in front of the camera."""
-        with self.conn.cursor() as cur:
-            cur.execute("""SELECT request_id::text, customer_id::text, EXTRACT(EPOCH FROM created_at)
-                           FROM enrollment_requests
-                           WHERE camera_id = %s AND status = 'PENDING'
-                             AND created_at > NOW() - INTERVAL '30 seconds'
-                           ORDER BY created_at LIMIT 1""", (self.cfg.camera_id,))
-            row = cur.fetchone()
-            if not row:
-                return
-            request_id, customer_id, created = row[0], row[1], float(row[2])
-            e = self.enroll_fn() if self.enroll_fn else None
-            waited = time.time() - created
+    def _settings(self):
+        row = self._q("SELECT value FROM app_settings WHERE key = 'camera_sources'", (), "one")
+        src = ""
+        if row and isinstance(row[0], dict):
+            src = str(((row[0].get(self.cfg.device_id) or {}).get("face") or {}).get("source") or "")
+        src = src or self.cfg.camera_source
+        if src != self.sources_seen:
+            self.sources_seen = src
+            self.camera.switch(src)
 
-            def finish(status: str, message: str, n: Optional[int] = None):
-                cur.execute("""UPDATE enrollment_requests SET status = %s, message = %s, n_frames = %s,
-                               completed_at = NOW() WHERE request_id = %s::uuid AND status = 'PENDING'""",
-                            (status, message, n, request_id))
+    def _commands(self):
+        row = self._q("""UPDATE device_commands SET status = 'RUNNING', started_at = NOW()
+                         WHERE command_id = (SELECT command_id FROM device_commands
+                                             WHERE device_id = %s AND status = 'PENDING'
+                                               AND created_at > NOW() - INTERVAL '2 minutes'
+                                             ORDER BY created_at LIMIT 1)
+                         RETURNING command_id::text, command, payload""", (self.cfg.device_id,), "one")
+        if not row:
+            return
+        cid, cmd, _payload = row
+        status, message, result = "DONE", "OK", {}
+        try:
+            if cmd == "self_check":
+                result = self.self_check()
+                bad = [c["name"] for c in result["checks"] if c["status"] == "fail"]
+                message = "Semua pemeriksaan lulus." if not bad else "Ada masalah: " + ", ".join(bad)
+            elif cmd == "reload_gallery":
+                self.load_gallery()
+                message = f"Galeri dimuat ulang ({self.gallery.stats()['customers']} pelanggan)."
+            elif cmd == "restart":
+                message = "Program dimulai ulang."
+                self.restart_requested = True
+            else:
+                status, message = "FAILED", f"Perintah tidak dikenal: {cmd}"
+        except Exception as e:
+            status, message = "FAILED", str(e)[:300]
+        self._q("""UPDATE device_commands SET status = %s, message = %s, result = %s::jsonb, finished_at = NOW()
+                   WHERE command_id = %s::uuid""", (status, message, json.dumps(result), cid))
+        if self.restart_requested:
+            log.info("[Cmd] restart requested from the CRM")
+            time.sleep(0.5)
+            os._exit(0)          # systemd (Restart=always) starts the program again
 
-            # Template must come from a face seen AFTER the cashier pressed the button.
-            fresh = e is not None and e["time"] >= created and time.time() - e["time"] <= self.cfg.enroll_max_age
-            if fresh and e["state"] == "known" and e["customer_id"] != customer_id                     and not self.cfg.allow_duplicate_enroll:
-                return finish("FAILED", f"Wajah ini sudah terdaftar sebagai {e['name'] or 'pelanggan lain'}.")
-            if fresh and e["faces_in_view"] > 1:
-                if waited > 15:
-                    finish("FAILED", "Ada lebih dari satu wajah di depan kamera.")
-                return
-            if not fresh or e["n_frames"] < self.cfg.enroll_min_frames:
-                if waited > 15:
-                    finish("FAILED", "Wajah tidak terlihat jelas di kamera kasir.")
-                return
-            # Re-enrollment replaces the customer's old (possibly legacy-model) embeddings.
-            cur.execute("DELETE FROM embeddings WHERE customer_id = %s::uuid", (customer_id,))
-            cur.execute("""INSERT INTO embeddings (embedding_id, customer_id, embedding_vector, model_name,
-                                                   is_primary, created_at)
-                           VALUES (gen_random_uuid(), %s::uuid, %s, 'mobilefacenet', TRUE, NOW())""",
-                        (customer_id, json.dumps(e["embedding"])))
-            finish("DONE", "OK", e["n_frames"])
-            log.info("[Enroll] customer %s enrolled from %d frames", customer_id[:8], e["n_frames"])
-            self.request_reload()
+    def self_check(self) -> dict:
+        st, cam = self.state, self.camera
+        checks = []
+
+        def add(name, ok, detail, hint=""):
+            checks.append({"name": name, "status": "ok" if ok is True else ("warn" if ok is None else "fail"),
+                           "detail": detail, "hint": hint})
+
+        add("Kamera wajah", cam.ok, f"{getattr(cam, 'opened', cam.source)} {cam.size[0]}x{cam.size[1]}" if cam.ok
+            else "tidak ada gambar", "Colok webcam ke UNO Q (lewat hub USB-C), lalu pilih di Perangkat > Kamera.")
+        add("Kecepatan", st.fps >= 3 or None, f"{st.fps:.1f} FPS, deteksi {st.det_ms:.0f} ms, ciri {st.emb_ms:.0f} ms",
+            "Di bawah 3 FPS: kurangi aplikasi lain di papan.")
+        g = self.gallery.stats()
+        add("Wajah terdaftar", g["customers"] > 0 or None, f"{g['customers']} pelanggan",
+            "Daftarkan wajah dari halaman Pelanggan (dengan persetujuan).")
+        if g["legacy"]:
+            add("Wajah model lama", None, f"{g['legacy']} pelanggan perlu didaftarkan ulang", "Buka Wajah Terdaftar.")
+        add("Database", True, "terhubung")
+        if self.cfg.pi_face_url:
+            add("Raspberry Pi", st.pi_ok if st.pi_ok is not None else None,
+                self.cfg.pi_face_url + (" (belum ada kiriman)" if st.pi_ok is None else ""),
+                "Periksa PI_FACE_URL dan FACE_TOKEN di .env UNO Q dan Pi.")
+        else:
+            add("Raspberry Pi", None, "PI_FACE_URL belum diisi", "Tanpa ini nama tidak ikut pada pelacakan.")
+        db_now = self._q("SELECT EXTRACT(EPOCH FROM NOW())", (), "one")[0]
+        skew = abs(float(db_now) - time.time())
+        add("Jam papan", skew < 5 or None, f"selisih {skew:.1f} detik dari server",
+            "Aktifkan sinkron waktu: sudo timedatectl set-ntp true")
+        add("Model", True, f"{MODEL_TAG} v{VERSION}, kunci brankas {self.engine.vault.fingerprint}")
+        return {"checks": checks, "at": utc_iso(time.time())}
+
+    def _frames(self):
+        key = f"{self.cfg.device_id}/face"
+        row = self._q("SELECT wanted_until > NOW() FROM device_frames WHERE camera_key = %s", (key,), "one")
+        if not row or not row[0]:
+            return
+        with self.state.lock:
+            img = None if self.state.preview is None else self.state.preview.copy()
+            view = dict(self.state.view)
+        if img is None:
+            return
+        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 65])
+        if not ok:
+            return
+        self._q("""UPDATE device_frames SET device_id = %s, camera = 'face', jpeg_b64 = %s, width = %s, height = %s,
+                   overlay = %s::jsonb, captured_at = NOW() WHERE camera_key = %s""",
+                (self.cfg.device_id, base64.b64encode(buf.tobytes()).decode(), img.shape[1], img.shape[0],
+                 json.dumps(view), key))
 
     def run(self):
-        backoff = 2.0
-        pending = None
+        backoff, pending = 2.0, None
         while True:
             try:
                 if self.conn is None or self.conn.closed:
                     self._connect()
                     backoff = 2.0
-                if time.time() >= self._reload_at:
-                    self._load_gallery()
-                    self._reload_at = time.time() + self.cfg.reload_interval
-                if time.time() >= self._next_enroll_poll:
-                    self._next_enroll_poll = time.time() + 1.5
-                    self._optional("enrollment", self._poll_enrollment)
-                if time.time() >= self._next_heartbeat:
-                    self._next_heartbeat = time.time() + self.cfg.heartbeat_sec
-                    self._optional("heartbeat", self._heartbeat)
+                now = time.time()
+                if now >= self.reload_at:
+                    self.load_gallery()
+                    self.reload_at = now + self.cfg.reload_interval
+                for name, every, fn in (("enrollment", 1.0, self._poll_enroll),
+                                        ("commands", 1.5, self._commands),
+                                        ("settings", 5.0, self._settings),
+                                        ("frames", 1.0, self._frames),
+                                        ("heartbeat", self.cfg.heartbeat_sec, self._heartbeat)):
+                    if now >= self.next[name]:
+                        self.next[name] = now + every
+                        self._optional(name, fn)
                 if pending is None:
                     try:
-                        pending = self.jobs.get(timeout=0.5)
+                        pending = self.jobs.get(timeout=0.2)
                     except queue.Empty:
                         continue
-                self._execute(*pending)
+                self._run_job(*pending)
                 pending = None
             except Exception as e:
                 self.online = False
-                log.warning("[DB] %s -- retrying in %.0fs (recognition keeps running)", e, backoff)
+                log.warning("[DB] %s -- retrying in %.0f s (recognition keeps running)", str(e).splitlines()[0], backoff)
                 try:
                     if self.conn is not None:
                         self.conn.close()
@@ -725,392 +972,236 @@ class Database(threading.Thread):
                 backoff = min(backoff * 2, 60.0)
 
 
-class CrmClient(threading.Thread):
-    """Tells the CRM a customer was confirmed at the cashier, so it binds the person-tracking
-    Track ID standing at the counter to this Customer ID (POST /api/association/bind)."""
+# ── Engine ────────────────────────────────────────────────────────────────────
 
-    def __init__(self, cfg: Config):
-        super().__init__(daemon=True, name="crm")
-        self.cfg = cfg
-        self.jobs: queue.Queue = queue.Queue(maxsize=50)
+class Engine:
+    def __init__(self, cfg: Config, state: State):
+        self.cfg, self.state = cfg, state
+        cv2.setNumThreads(cfg.threads)
+        self.det = SCRFD(det_model_path(cfg.det_size), cfg.det_size, cfg.det_thresh)
+        self.rec = MobileFaceNet(find_model("w600k_mbf.onnx"))
+        self.vault = Vault(load_vault_key(cfg))
+        self.gallery = Gallery()
+        self.sess = Session()
+        self.enroll_sess: Optional[Session] = None
+        self.enroll_req: Optional[tuple] = None
+        self.enroll_t0 = 0.0
+        self.db: Optional[Database] = None
+        self.pi: Optional[PiLink] = None
+        self.last_known: dict[str, float] = {}
+        self.last_unknown = 0.0
+        self.message = ""
+        self.message_until = 0.0
 
-    def bind(self, customer_id: str, when: float):
-        try:
-            self.jobs.put_nowait({"customer_id": customer_id,
-                                  "face_timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(when))})
-        except queue.Full:
-            pass
+    def start_enroll(self, request_id: str, customer_id: str):
+        # Session first, request last: the camera loop reads enroll_req without a lock.
+        self.enroll_sess = Session()
+        self.enroll_t0 = time.time()
+        self.enroll_req = (request_id, customer_id)
+        with self.state.lock:
+            self.state.enroll = {"request_id": request_id, "customer_id": customer_id}
 
-    def run(self):
-        url = self.cfg.crm_url.rstrip("/") + "/api/association/bind"
-        while True:
-            job = self.jobs.get()
-            req = urllib.request.Request(url, data=json.dumps(job).encode(), method="POST", headers={
-                "Content-Type": "application/json", "x-device-key": self.cfg.device_api_key})
-            try:
-                with urllib.request.urlopen(req, timeout=8) as r:
-                    res = json.loads(r.read() or b"{}")
-                log.info("[Assoc] %s -> %s track=%s score=%s", job["customer_id"][:8], res.get("status"),
-                         res.get("track_id"), res.get("score"))
-            except Exception as e:
-                log.warning("[Assoc] CRM unreachable (%s); cashier can confirm manually", e)
+    def _end_enroll(self, ok: bool, message: str, embs=None):
+        rid, cid = self.enroll_req
+        self.enroll_req, self.enroll_sess = None, None
+        with self.state.lock:
+            self.state.enroll = None
+        self.flash(("Wajah tersimpan" if ok else "Gagal: " + message), 3.0)
+        if self.db:
+            self.db.submit("enroll_done", request_id=rid, customer_id=cid, ok=ok, message=message,
+                           embs=[e.tolist() for e in embs] if embs else None)
 
+    def flash(self, text: str, sec: float = 2.5):
+        self.message, self.message_until = text, time.time() + sec
 
-# ── Camera (always hands out the newest frame -> no buffer lag) ──────────────
+    def embed(self, frame: np.ndarray, face: Face) -> np.ndarray:
+        t = time.perf_counter()
+        e = self.vault.protect(self.rec.embed(align(frame, face.kps)))
+        self.state.emb_ms = 0.9 * self.state.emb_ms + 0.1 * (time.perf_counter() - t) * 1000
+        return e
 
-class Camera(threading.Thread):
-    def __init__(self, cfg: Config):
-        super().__init__(daemon=True, name="camera")
-        self.cfg = cfg
-        self.cap = None
-        self._cond = threading.Condition()
-        self._frame = None
-        self._seq = 0
-
-    def _open(self) -> bool:
-        backend = cv2.CAP_V4L2 if sys.platform.startswith("linux") else cv2.CAP_ANY
-        indices = [self.cfg.camera_index] if self.cfg.camera_index >= 0 else range(5)
-        for i in indices:
-            cap = cv2.VideoCapture(i, backend)
-            if not cap.isOpened():
-                cap.release()
-                continue
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))  # less USB bandwidth / CPU
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.cfg.frame_w)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.cfg.frame_h)
-            cap.set(cv2.CAP_PROP_FPS, 30)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            ok, frame = cap.read()
-            if ok and frame is not None:
-                log.info("[Camera] /dev/video%d opened at %dx%d", i, frame.shape[1], frame.shape[0])
-                self.cap = cap
-                return True
-            cap.release()
-        return False
-
-    def run(self):
-        fails = 0
-        while True:
-            if self.cap is None and not self._open():
-                log.error("[Camera] No webcam found, retrying in 3s ...")
-                time.sleep(3)
-                continue
-            ok, frame = self.cap.read()
-            if not ok or frame is None:
-                fails += 1
-                if fails > 30:
-                    log.warning("[Camera] Lost camera, reopening")
-                    self.cap.release()
-                    self.cap = None
-                    fails = 0
-                time.sleep(0.01)
-                continue
-            fails = 0
-            with self._cond:
-                self._frame, self._seq = frame, self._seq + 1
-                self._cond.notify_all()
-
-    def latest(self, after_seq: int, timeout: float = 1.0):
-        with self._cond:
-            self._cond.wait_for(lambda: self._seq > after_seq, timeout=timeout)
-            return self._frame, self._seq
-
-
-# ── Shared state between the camera loop and the HTTP server ─────────────────
-
-class AppState:
-    def __init__(self, cfg: Config, engine: FaceEngine, db: Optional[Database], crm: Optional["CrmClient"] = None):
-        self.cfg = cfg
-        self.engine = engine
-        self.db = db
-        self.crm = crm
-        self.lock = threading.Lock()
-        self.jpeg: Optional[bytes] = None
-        self.jpeg_seq = 0
-        self.stream_clients = 0
-        self.enroll: Optional[dict] = None   # template of the main face currently in view
-        self.fps = 0.0
-        self.faces_in_view = 0
-        self.started = time.time()
-
-
-# ── Overlay ───────────────────────────────────────────────────────────────────
-
-def draw(frame: np.ndarray, tracks: list[Track], engine: FaceEngine, fps: float) -> np.ndarray:
-    out = frame.copy()
-    for t in tracks:
-        x1, y1, x2, y2 = [int(v) for v in t.bbox]
-        if t.state == "known":
-            color, label = (70, 200, 70), f"{engine.gallery.name_of(t.customer_id) or t.customer_id[:8]} {t.score:.2f}"
-        elif t.state == "unknown":
-            color, label = (0, 165, 255), f"Unknown {t.score:.2f}"
+    def step(self, frame: np.ndarray, now: float):
+        t = time.perf_counter()
+        faces = self.det.detect(frame)
+        self.state.det_ms = 0.9 * self.state.det_ms + 0.1 * (time.perf_counter() - t) * 1000
+        face, q, reason = quality(frame, faces)
+        if self.enroll_req is not None:
+            self._step_enroll(frame, now, faces, face, q, reason)
         else:
-            color, label = (200, 200, 200), t.quality_msg or "recognizing..."
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-        cv2.rectangle(out, (x1, max(0, y1 - th - 10)), (x1 + tw + 8, y1), color, -1)
-        cv2.putText(out, label, (x1 + 4, max(th + 2, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                    (20, 20, 20), 1, cv2.LINE_AA)
-    tm = engine.timing
-    hud = f"FPS {fps:.1f} | det {tm['det_ms']:.0f}ms | emb {tm['emb_ms']:.0f}ms"
-    cv2.putText(out, hud, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
-    cv2.putText(out, hud, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 1, cv2.LINE_AA)
-    return out
+            self._step_recognize(frame, now, face, q, reason)
+        self._preview(frame, faces, face, q, reason, now)
+
+    def _step_recognize(self, frame, now, face, q, reason):
+        s = self.sess
+        if q is None:
+            if s.samples and now - s.t_last > 1.0:
+                self._close_session(now)
+            return
+        e = self.embed(frame, face)
+        if s.samples and float(e @ s.mean()) < 0.40:       # a different person: close the old session
+            self._close_session(now)
+            s = self.sess
+        if not s.samples:
+            s.t0 = now
+        s.samples.append(Sample(q, e))
+        s.t_last = now
+        if len(s.samples) >= self.cfg.session_frames or now - s.t0 >= self.cfg.session_max_sec:
+            self._close_session(now)
+
+    def _close_session(self, now: float):
+        s, self.sess = self.sess, Session()
+        if len(s.samples) < self.cfg.session_min_frames or max(x.q for x in s.samples) < 0.30:
+            return
+        d = decide(self.cfg, self.gallery, s)
+        self.state.last_decision = d
+        name = self.gallery.name(d.customer_id)
+        if d.state == "known":
+            self.flash(f"{name or d.customer_id[:8]} ({d.score:.2f})")
+            log.info("[KNOWN] %s score=%.3f margin=%.3f votes=%s frames=%d", name, d.score, d.margin, d.votes, d.n)
+            if self.pi:
+                self.pi.send(d.customer_id, d.score, name)
+            if now - self.last_known.get(d.customer_id, 0.0) >= self.cfg.known_log_cooldown:
+                self.last_known[d.customer_id] = now
+                if self.db:
+                    self.db.submit("log", customer_id=d.customer_id, score=d.score)
+                    self.db.submit("visit", customer_id=d.customer_id)
+        elif d.state == "unknown":
+            self.flash("Belum terdaftar")
+            if now - self.last_unknown >= self.cfg.unknown_log_cooldown:
+                self.last_unknown = now
+                log.info("[UNKNOWN] best=%.3f frames=%d", d.score, d.n)
+                if self.db:
+                    self.db.submit("log", customer_id=None, score=d.score)
+        else:
+            self.flash("Belum yakin, tahan sebentar")
+            log.info("[UNCERTAIN] best=%.3f margin=%.3f votes=%s", d.score, d.margin, d.votes)
+
+    def _step_enroll(self, frame, now, faces, face, q, reason):
+        s = self.enroll_sess
+        if now - self.enroll_t0 > self.cfg.enroll_timeout:
+            msg = ("Ada lebih dari satu wajah di depan kamera." if reason == "Beberapa wajah sama dekat"
+                   else "Wajah tidak terlihat jelas di kamera kasir. Minta pelanggan menghadap kamera.")
+            return self._end_enroll(False, msg)
+        if q is None:
+            return
+        s.samples.append(Sample(q, self.embed(frame, face)))
+        if len(s.samples) < self.cfg.enroll_frames:
+            return
+        keep = s.best(self.cfg.enroll_keep)
+        mean = l2n(np.mean([k.emb for k in keep], axis=0))
+        if len(keep) < 3 or min(float(k.emb @ mean) for k in keep) < 0.50:
+            return self._end_enroll(False, "Foto wajah tidak konsisten (orang berganti?). Ulangi.")
+        rid, cid = self.enroll_req
+        other, score, _ = self.gallery.top2(mean, exclude=cid)
+        if other is not None and score >= self.cfg.match_threshold:
+            return self._end_enroll(False, f"Wajah ini sudah terdaftar sebagai {self.gallery.name(other) or 'pelanggan lain'}.")
+        self._end_enroll(True, "OK", [k.emb for k in keep])
+
+    def _preview(self, frame, faces, face, q, reason, now):
+        view = {"faces": [], "status": "", "enrolling": self.enroll_req is not None}
+        h, w = frame.shape[:2]
+        for f in faces[:3]:
+            view["faces"].append({"box": [round(float(f.box[0]) / w, 4), round(float(f.box[1]) / h, 4),
+                                          round(float(f.box[2]) / w, 4), round(float(f.box[3]) / h, 4)],
+                                  "main": f is face})
+        label = self.message if now < self.message_until else (
+            "Mendaftarkan wajah..." if self.enroll_req else (reason or f"mutu {q:.2f}" if q is not None else reason))
+        view["status"] = label
+        img = frame.copy()
+        for f in faces[:3]:
+            x1, y1, x2, y2 = [int(v) for v in f.box]
+            col = (60, 200, 60) if f is face and q is not None else (160, 160, 160)
+            cv2.rectangle(img, (x1, y1), (x2, y2), col, 2)
+        cv2.rectangle(img, (0, 0), (w, 30), (0, 0, 0), -1)
+        cv2.putText(img, label.encode("ascii", "replace").decode(), (8, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (255, 255, 255), 1, cv2.LINE_AA)
+        with self.state.lock:
+            self.state.preview, self.state.view = img, view
 
 
-# ── HTTP server ───────────────────────────────────────────────────────────────
+# ── Local HTTP (on the board only: preview + health) ──────────────────────────
 
-def _read_upload(handler: BaseHTTPRequestHandler) -> Optional[bytes]:
-    length = int(handler.headers.get("Content-Length") or 0)
-    if length <= 0 or length > 10 * 1024 * 1024:
-        return None
-    body = handler.rfile.read(length)
-    ctype = handler.headers.get("Content-Type", "")
-    if not ctype.startswith("multipart/form-data"):
-        return body
-    msg = email.parser.BytesParser(policy=email.policy.default).parsebytes(
-        b"Content-Type: " + ctype.encode() + b"\r\n\r\n" + body)
-    for part in msg.iter_parts():
-        if part.get_filename() or part.get_param("name", header="content-disposition") == "file":
-            return part.get_payload(decode=True)
-    return None
-
-
-def make_handler(state: AppState):
-    class Handler(BaseHTTPRequestHandler):
+def http_handler(state: State, engine: Engine, cfg: Config):
+    class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"
 
-        def log_message(self, *args):
+        def log_message(self, *a):
             pass
 
-        def _json(self, code: int, payload: dict):
-            data = json.dumps(payload).encode()
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(data)
-
-        def do_OPTIONS(self):
-            self.send_response(204)
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "*")
-            self.end_headers()
-
         def do_GET(self):
-            path = self.path.split("?")[0]
-            if path in ("/", "/video_feed"):
-                return self._stream()
-            if path == "/latest-embedding":
-                return self._latest_embedding()
-            if path == "/health":
-                return self._health()
-            self._json(404, {"detail": "Not found"})
-
-        def do_POST(self):
-            path = self.path.split("?")[0]
-            if path == "/reload-gallery":
-                if state.db is None:
-                    return self._json(503, {"detail": "No database configured."})
-                state.db.request_reload()
-                return self._json(202, {"detail": "Gallery reload scheduled."})
-            if path not in ("/extract-embedding", "/recognize"):
-                return self._json(404, {"detail": "Not found"})
-            raw = _read_upload(self)
-            img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR) if raw else None
-            if img is None:
-                return self._json(400, {"detail": "Invalid or missing image (multipart field 'file')."})
-            t0 = time.perf_counter()
-            res = state.engine.embed_image(img)
-            if not res["ok"]:
-                return self._json(400, {"detail": res["message"]})
-            if path == "/extract-embedding":
-                return self._json(200, {"embedding": res["embedding"].tolist(),
-                                        "det_score": round(res["det_score"], 4), "bbox": res["bbox"]})
-            cid, score = state.engine.match(res["embedding"])
-            self._json(200, {"status": "known" if cid else "unknown", "customer_id": cid,
-                             "name": state.engine.gallery.name_of(cid), "score": round(score, 4),
-                             "threshold": state.cfg.match_threshold, "bbox": res["bbox"],
-                             "latency_ms": round((time.perf_counter() - t0) * 1000, 1)})
-
-        def _latest_embedding(self):
-            with state.lock:
-                e = state.enroll
-            if e is None or time.time() - e["time"] > state.cfg.enroll_max_age:
-                return self._json(404, {"detail": "Belum ada wajah terdeteksi di kamera. "
-                                                  "Minta pelanggan menghadap kamera."})
-            if e["n_frames"] < state.cfg.enroll_min_frames:
-                return self._json(404, {"detail": "Wajah belum cukup jelas, tahan posisi sebentar."})
-            if e["state"] == "known" and not state.cfg.allow_duplicate_enroll:
-                return self._json(409, {"detail": f"Wajah ini sudah terdaftar sebagai "
-                                                  f"{e['name'] or e['customer_id']}."})
-            # The CRM saves this embedding right after the call: pick it up a few seconds later
-            # so the new customer is recognised immediately instead of after RELOAD_INTERVAL.
-            if state.db is not None:
-                state.db.request_reload(delay=5.0)
-            self._json(200, {"embedding": e["embedding"], "n_frames": e["n_frames"],
-                             "faces_in_view": e["faces_in_view"],
-                             "recognition": {"status": e["state"], "customer_id": e["customer_id"],
-                                             "score": e["score"]}})
-
-        def _health(self):
-            self._json(200, {
-                "status": "ok", "camera_id": state.cfg.camera_id, "model": MODEL_TAG,
-                "uptime_s": round(time.time() - state.started), "fps": round(state.fps, 1),
-                "timing_ms": {k: round(v, 1) for k, v in state.engine.timing.items()},
-                "faces_in_view": state.faces_in_view, "gallery": state.engine.gallery.stats(),
-                "db_online": bool(state.db and state.db.online),
-                "threshold": state.cfg.match_threshold,
-                "voting": {"window": state.cfg.vote_window, "min_votes": state.cfg.vote_min},
-                "quality": {"min_face_px": state.cfg.min_face_px, "max_yaw": state.cfg.max_yaw,
-                            "min_sharpness": state.cfg.min_sharpness},
-            })
-
-        def _stream(self):
-            self.send_response(200)
-            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            with state.lock:
-                state.stream_clients += 1
-            last = 0
-            try:
-                while True:
-                    with state.lock:
-                        jpeg, seq = state.jpeg, state.jpeg_seq
-                    if jpeg is not None and seq != last:
-                        last = seq
-                        self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
-                                         + str(len(jpeg)).encode() + b"\r\n\r\n" + jpeg + b"\r\n")
-                    time.sleep(0.02)
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                pass
-            finally:
-                with state.lock:
-                    state.stream_clients -= 1
-    return Handler
+            p = self.path.split("?")[0]
+            if p == "/health":
+                body = json.dumps({"status": "ok", "device_id": cfg.device_id, "version": VERSION,
+                                   "fps": round(state.fps, 1), "gallery": engine.gallery.stats(),
+                                   "db_online": bool(engine.db and engine.db.online)}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if p in ("/", "/video_feed"):
+                self.send_response(200)
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                self.end_headers()
+                try:
+                    while True:
+                        with state.lock:
+                            img = state.preview
+                        if img is not None:
+                            ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                            if ok:
+                                b = buf.tobytes()
+                                self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                                                 + str(len(b)).encode() + b"\r\n\r\n" + b + b"\r\n")
+                        time.sleep(0.1)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return
+            self.send_error(404)
+    return H
 
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
-
-def handle_events(state: AppState, changed: list[Track], now: float, last_known: dict, last_unknown: list):
-    """Turn confirmed track decisions into Supabase rows (one per person, not per frame)."""
-    for t in changed:
-        key = (t.state, t.customer_id)
-        if t.logged_state == key:
-            continue
-        t.logged_state = key
-        name = state.engine.gallery.name_of(t.customer_id)
-        if t.state == "known":
-            if now - last_known.get(t.customer_id, 0) < state.cfg.known_log_cooldown:
-                continue
-            last_known[t.customer_id] = now
-            log.info("[KNOWN]   %s (%s) score=%.3f track=%d", name, t.customer_id[:8], t.score, t.track_id)
-            if state.db:
-                state.db.submit("log", customer_id=t.customer_id, score=t.score)
-                state.db.submit("visit", customer_id=t.customer_id)
-            if state.crm:
-                state.crm.bind(t.customer_id, now)
-        else:
-            if now - last_unknown[0] < state.cfg.unknown_log_cooldown:
-                continue
-            last_unknown[0] = now
-            log.info("[UNKNOWN] score=%.3f track=%d", t.score, t.track_id)
-            if state.db:
-                state.db.submit("log", customer_id=None, score=t.score)
-
-
-def update_enrollment(state: AppState, visible: list[Track], now: float):
-    """Keep an averaged template of the largest face in view for /latest-embedding."""
-    if not visible:
-        return
-    main = max(visible, key=lambda t: (t.bbox[2] - t.bbox[0]) * (t.bbox[3] - t.bbox[1]))
-    if not main.samples:
-        return
-    template = l2_normalize(np.mean(np.stack(main.samples), axis=0))
-    with state.lock:
-        state.enroll = {"time": now, "embedding": template.tolist(), "n_frames": len(main.samples),
-                        "faces_in_view": len(visible), "state": main.state,
-                        "customer_id": main.customer_id, "name": state.engine.gallery.name_of(main.customer_id),
-                        "score": round(main.score, 4)}
-
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     cfg = Config()
-    log.info("=" * 60)
-    log.info(" Cafe FaceRec -- SCRFD-0.5G + MobileFaceNet + FAISS (UNO Q)")
-    log.info("=" * 60)
-    if not cfg.database_url:
-        log.warning("DATABASE_URL not set: running offline (no gallery, nothing logged).")
-
-    engine = FaceEngine(cfg)
-    log.info("[Model] ready | threads=%d det_size=%d tau=%.3f vote=%d/%d",
-             cfg.num_threads, cfg.det_size, cfg.match_threshold, cfg.vote_min, cfg.vote_window)
-
-    db = None
-    if cfg.database_url:
-        db = Database(cfg, engine.gallery)
-        db.start()
-        if not db.gallery_loaded.wait(timeout=20):
-            log.warning("[Gallery] Not loaded yet (DB unreachable?) -- starting anyway, will retry.")
-
-    crm = None
-    if cfg.crm_url and cfg.device_api_key:
-        crm = CrmClient(cfg)
-        crm.start()
-    else:
-        log.info("[Assoc] CRM_URL / DEVICE_API_KEY not set: identity association left to the cashier")
-
-    state = AppState(cfg, engine, db, crm)
-    if db:
-        def enroll_snapshot():
-            with state.lock:
-                return dict(state.enroll) if state.enroll else None
-        db.enroll_fn = enroll_snapshot
-        db.status_fn = lambda: {"fps": round(state.fps, 1), "faces_in_view": state.faces_in_view,
-                                "threshold": cfg.match_threshold, "model": MODEL_TAG,
-                                "timing_ms": {k: round(v, 1) for k, v in engine.timing.items()}}
+    log.info("Cafe FaceRec %s on %s -- SCRFD-0.5G + MobileFaceNet + FAISS (OpenCV DNN)", VERSION, socket.gethostname())
+    state = State()
+    engine = Engine(cfg, state)
+    log.info("[Model] ready | tau=%.2f margin=%.2f vote>=%.0f%% | vault %s", cfg.match_threshold,
+             cfg.match_margin, cfg.vote_ratio * 100, engine.vault.fingerprint)
     camera = Camera(cfg)
+    if cfg.database_url:
+        engine.db = Database(cfg, engine.gallery, state, camera, engine)
+        engine.db.start()
+        if not engine.db.loaded.wait(timeout=20):
+            log.warning("[Gallery] not loaded yet (database unreachable?) -- starting anyway")
+    else:
+        log.warning("DATABASE_URL is empty: offline mode, nobody can be recognised or enrolled")
+    if cfg.pi_face_url:
+        engine.pi = PiLink(cfg, state)
+        engine.pi.start()
+    else:
+        log.warning("PI_FACE_URL is empty: names will not be linked to the person tracking")
     camera.start()
-
-    server = ThreadingHTTPServer(("0.0.0.0", cfg.port), make_handler(state))
+    server = ThreadingHTTPServer((cfg.local_host, cfg.local_port), http_handler(state, engine, cfg))
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True, name="http").start()
-    log.info("[HTTP] http://<uno-q-ip>:%d/video_feed  /latest-embedding  /health", cfg.port)
+    log.info("[HTTP] http://%s:%d/video_feed  /health", cfg.local_host, cfg.local_port)
 
-    last_known: dict[str, float] = {}
-    last_unknown = [0.0]
-    seq, n_frames, fps_t0, last_jpeg = 0, 0, time.time(), 0.0
+    seq, n, t_fps = 0, 0, time.time()
     try:
         while True:
             frame, seq = camera.latest(seq)
             if frame is None:
                 continue
             now = time.time()
-            visible, changed = engine.process(frame, now)
-            handle_events(state, changed, now, last_known, last_unknown)
-            update_enrollment(state, visible, now)
-            state.faces_in_view = len(visible)
-
-            n_frames += 1
-            if now - fps_t0 >= 1.0:
-                state.fps, n_frames, fps_t0 = n_frames / (now - fps_t0), 0, now
-
-            # Encode the overlay only when someone is watching, capped at STREAM_FPS.
-            if state.stream_clients > 0 and now - last_jpeg >= 1.0 / cfg.stream_fps:
-                last_jpeg = now
-                ok, buf = cv2.imencode(".jpg", draw(frame, visible, engine, state.fps),
-                                       [cv2.IMWRITE_JPEG_QUALITY, cfg.jpeg_quality])
-                if ok:
-                    with state.lock:
-                        state.jpeg, state.jpeg_seq = buf.tobytes(), state.jpeg_seq + 1
+            engine.step(frame, now)
+            n += 1
+            if now - t_fps >= 2.0:
+                state.fps, n, t_fps = n / (now - t_fps), 0, now
     except KeyboardInterrupt:
-        log.info("Stopped.")
-    finally:
-        server.shutdown()
+        log.info("stopped")
 
 
 if __name__ == "__main__":
