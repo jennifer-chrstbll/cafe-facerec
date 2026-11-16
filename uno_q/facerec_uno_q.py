@@ -32,6 +32,7 @@ import collections
 import glob
 import hashlib
 import hmac
+import http.client
 import json
 import logging
 import os
@@ -43,6 +44,8 @@ import time
 import urllib.request
 import zipfile
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
@@ -116,6 +119,8 @@ class Config:
     visit_reopen_min: int = _env("VISIT_REOPEN_MIN", 30, int)
     reload_interval: float = _env("RELOAD_INTERVAL", 120.0, float)
     heartbeat_sec: float = _env("HEARTBEAT_SEC", 10.0, float)
+    stream_fps: float = _env("STREAM_FPS", 10.0, float)      # live pictures to the CRM while watched
+    stream_monthly_max: int = _env("STREAM_MONTHLY_MAX", 450_000, int)   # Realtime pictures/month (0 = no cap)
 
     pi_face_url: str = _env("PI_FACE_URL", "")               # http://<pi-ip>:8765/wajah, or "auto"
     face_token: str = _env("FACE_TOKEN", "")                 # same as FACE_TOKEN on the Pi
@@ -634,6 +639,7 @@ class State:
         self.last_decision: Optional[Decision] = None
         self.view: dict = {}               # what is on screen right now (for the overlay)
         self.preview: Optional[np.ndarray] = None
+        self.preview_seq = 0
         self.enroll: Optional[dict] = None  # active enrollment request
         self.pi_ok: Optional[bool] = None
         self.started = time.time()
@@ -685,7 +691,151 @@ class PiLink(threading.Thread):
                 log.warning("[Pi] %s unreachable: %s", url, e)
 
 
-# ── Database thread (all network I/O off the camera loop) ─────────────────────
+# ── Live pictures to the CRM over Supabase Realtime (same as the Pi's streamer.py) ──
+
+class FrameStreamer(threading.Thread):
+    IDLE_FPS = 2.0
+
+    def __init__(self, source, fps: float = 8.0, max_width: int = 512, quality: int = 60,
+                 monthly_max: int = 450_000, budget_path: str | None = None):
+        """source() -> list of (camera_key, image, overlay, frame_key) for the cameras being watched."""
+        super().__init__(daemon=True, name="stream")
+        self.source, self.fps, self.max_width, self.quality = source, max(1.0, fps), max_width, quality
+        self.monthly_max, self.budget_path = monthly_max, budget_path
+        self.month, self.used = self._load_budget()
+        self.saved_used = self.used
+        self.last_sent: dict = {}
+        self.conf = None
+        self.lock = threading.Lock()
+        self.conn = None
+        self.ok_at = 0.0
+        self.fail = 0
+        self.pause_until = 0.0
+        self.sent: dict = {}
+
+    def configure(self, conf: dict | None):
+        conf = conf if conf and conf.get("url") and conf.get("key") and conf.get("topic") else None
+        with self.lock:
+            if conf != self.conf:
+                self.conf = conf
+                self._close()
+                if conf:
+                    log.info("[Stream] live pictures over Realtime (%s)", urlparse(conf["url"]).hostname)
+
+    @staticmethod
+    def _this_month() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m")
+
+    def _load_budget(self):
+        try:
+            with open(self.budget_path, encoding="utf-8") as f:
+                d = json.load(f)
+            if d.get("month") == self._this_month():
+                return d["month"], int(d.get("sent", 0))
+        except Exception:
+            pass
+        return self._this_month(), 0
+
+    def _save_budget(self):
+        if not self.budget_path or self.used == self.saved_used:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.budget_path) or ".", exist_ok=True)
+            tmp = self.budget_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"month": self.month, "sent": self.used}, f)
+            os.replace(tmp, self.budget_path)
+            self.saved_used = self.used
+        except Exception:
+            pass
+
+    def _budget_left(self) -> bool:
+        m = self._this_month()
+        if m != self.month:                       # new month: the quota starts again
+            self.month, self.used = m, 0
+        if self.monthly_max > 0 and self.used >= self.monthly_max:
+            if self.used == self.monthly_max:
+                log.warning("[Stream] monthly Realtime budget used (%d pictures); live view uses stored "
+                            "frames until next month (STREAM_MONTHLY_MAX)", self.used)
+                self.used += 1                    # log once
+                self._save_budget()
+            return False
+        return True
+
+    def stats(self) -> dict:
+        return {"month": self.month, "sent": self.used, "max": self.monthly_max, "active": self.active}
+
+    @property
+    def active(self) -> bool:
+        """True while pictures are reaching Realtime (the stored-frame fallback can slow down)."""
+        return time.time() - self.ok_at < 3.0
+
+    def _close(self):
+        try:
+            if self.conn is not None:
+                self.conn.close()
+        except Exception:
+            pass
+        self.conn = None
+
+    def _post(self, conf: dict, payload: dict):
+        u = urlparse(conf["url"])
+        if self.conn is None:
+            cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+            self.conn = cls(u.netloc, timeout=5)
+        body = json.dumps({"messages": [{"topic": conf["topic"], "event": "frame", "payload": payload}]})
+        self.conn.request("POST", "/realtime/v1/api/broadcast", body=body, headers={
+            "apikey": conf["key"], "Authorization": f"Bearer {conf['key']}", "Content-Type": "application/json"})
+        r = self.conn.getresponse()
+        r.read()
+        if r.status >= 300:
+            raise RuntimeError(f"HTTP {r.status}")
+
+    def run(self):
+        period = 1.0 / self.fps
+        last_save = time.time()
+        while True:
+            t0 = time.time()
+            with self.lock:
+                conf = self.conf
+            if t0 - last_save > 30:
+                self._save_budget()
+                last_save = t0
+            if conf and t0 >= self.pause_until and self._budget_left():
+                try:
+                    items = self.source() or []
+                except Exception:
+                    items = []
+                for key, img, overlay, frame_key in items:
+                    if self.sent.get(key) == frame_key:
+                        continue
+                    busy = bool((overlay or {}).get("people") or (overlay or {}).get("faces"))
+                    if not busy and t0 - self.last_sent.get(key, 0.0) < 1.0 / self.IDLE_FPS:
+                        continue                  # empty scene: a few pictures a second are enough
+                    self.sent[key] = frame_key
+                    self.last_sent[key] = t0
+                    h, w = img.shape[:2]
+                    if w > self.max_width:
+                        img = cv2.resize(img, (self.max_width, int(h * self.max_width / w)), interpolation=cv2.INTER_AREA)
+                    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, self.quality])
+                    if not ok:
+                        continue
+                    payload = {"k": key, "img": base64.b64encode(buf.tobytes()).decode(), "w": w, "h": h,
+                               "o": overlay, "t": datetime.now(timezone.utc).isoformat(timespec="milliseconds")}
+                    try:
+                        self._post(conf, json.loads(json.dumps(payload, default=str)))
+                        self.ok_at, self.fail = time.time(), 0
+                        self.used += 1
+                    except Exception as e:
+                        self._close()
+                        self.fail += 1
+                        if self.fail in (1, 10) or self.fail % 100 == 0:
+                            log.warning("[Stream] Realtime send failed (%s); the CRM falls back to stored frames", e)
+                        if self.fail >= 3:
+                            self.pause_until = time.time() + 10      # back off, then try again
+                        break
+            time.sleep(max(0.0, period - (time.time() - t0)))
+
 
 def parse_vec(v) -> np.ndarray:
     if isinstance(v, str):
@@ -860,6 +1010,9 @@ class Database(threading.Thread):
         src = ""
         if row and isinstance(row[0], dict):
             src = str(((row[0].get(self.cfg.device_id) or {}).get("face") or {}).get("source") or "")
+        st = self._q("SELECT value FROM app_settings WHERE key = 'stream'", (), "one")
+        if self.engine.streamer is not None:
+            self.engine.streamer.configure(st[0] if st and isinstance(st[0], dict) else None)
         src = src or self.cfg.camera_source
         if src != self.sources_seen:
             self.sources_seen = src
@@ -972,6 +1125,10 @@ class Database(threading.Thread):
             self.watch_until = now + float(row[0]) if row and row[0] is not None else 0.0
         if now >= getattr(self, "watch_until", 0.0):
             return
+        if self.engine.streamer is not None and self.engine.streamer.active:
+            if now - getattr(self, "db_frame_at", 0.0) < 1.0:
+                return                            # live pictures go over Realtime; keep a 1/s fallback
+        self.db_frame_at = now
         with self.state.lock:
             img = None if self.state.preview is None else self.state.preview.copy()
             view = dict(self.state.view)
@@ -1042,6 +1199,7 @@ class Engine:
         self.enroll_t0 = 0.0
         self.db: Optional[Database] = None
         self.pi: Optional[PiLink] = None
+        self.streamer: Optional[FrameStreamer] = None
         self.last_known: dict[str, float] = {}
         self.last_unknown = 0.0
         self.message = ""
@@ -1183,6 +1341,7 @@ class Engine:
                     (255, 255, 255), 1, cv2.LINE_AA)
         with self.state.lock:
             self.state.preview, self.state.view = img, view
+            self.state.preview_seq += 1
 
 
 # ── Local HTTP (on the board only: preview + health) ──────────────────────────
@@ -1246,6 +1405,18 @@ def main():
         log.warning("DATABASE_URL is empty: offline mode, nobody can be recognised or enrolled")
     engine.pi = PiLink(cfg, state)       # address may also come from the CRM / the Pi's heartbeat
     engine.pi.start()
+
+    def stream_source():
+        db = engine.db
+        if db is None or time.time() >= getattr(db, "watch_until", 0.0):
+            return []
+        with state.lock:
+            img, view, seq = state.preview, dict(state.view), state.preview_seq
+        return [] if img is None else [(f"{cfg.device_id}/face", img, view, seq)]
+    engine.streamer = FrameStreamer(stream_source, fps=cfg.stream_fps, max_width=480, quality=60,
+                                    monthly_max=cfg.stream_monthly_max,
+                                    budget_path=str(HERE / "data" / "stream_budget.json"))
+    engine.streamer.start()
     camera.start()
     server = ThreadingHTTPServer((cfg.local_host, cfg.local_port), http_handler(state, engine, cfg))
     server.daemon_threads = True
