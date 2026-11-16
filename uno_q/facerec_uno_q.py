@@ -101,6 +101,10 @@ class Config:
     session_frames: int = _env("SESSION_FRAMES", 10, int)
     session_max_sec: float = _env("SESSION_MAX_SEC", 2.5, float)
     session_min_frames: int = _env("SESSION_MIN_FRAMES", 3, int)
+    # Early decision: after EARLY_FRAMES frames, decide at once if the evidence is already much
+    # stronger than the normal rule requires (sequential decision, Wald 1945): every frame votes
+    # for the same customer, score >= tau + 0.10 and margin >= 2 x MATCH_MARGIN.
+    early_frames: int = _env("EARLY_FRAMES", 4, int)
 
     enroll_frames: int = _env("ENROLL_FRAMES", 20, int)
     enroll_keep: int = _env("ENROLL_KEEP", 5, int)
@@ -113,7 +117,7 @@ class Config:
     reload_interval: float = _env("RELOAD_INTERVAL", 120.0, float)
     heartbeat_sec: float = _env("HEARTBEAT_SEC", 10.0, float)
 
-    pi_face_url: str = _env("PI_FACE_URL", "")               # http://<pi-ip>:8765/wajah
+    pi_face_url: str = _env("PI_FACE_URL", "")               # http://<pi-ip>:8765/wajah, or "auto"
     face_token: str = _env("FACE_TOKEN", "")                 # same as FACE_TOKEN on the Pi
     pi_cooldown: float = _env("PI_COOLDOWN", 2.0, float)
     area_camera: str = _env("AREA_CAMERA_ID", "CAM_1")       # Pi camera that sees the cashier
@@ -641,10 +645,16 @@ class PiLink(threading.Thread):
     def __init__(self, cfg: Config, state: State):
         super().__init__(daemon=True, name="pi")
         self.cfg, self.state = cfg, state
+        # Where face events go. Set from .env, then kept up to date from the CRM
+        # (Perangkat -> Alamat Raspberry Pi: automatic from the Pi's heartbeat, or manual).
+        self.url = "" if cfg.pi_face_url.lower() in ("", "auto") else cfg.pi_face_url
+        self.mode = "env" if self.url else "auto"
         self.q: queue.Queue = queue.Queue(maxsize=20)
         self.last: dict[str, float] = {}
 
     def send(self, cid: str, score: float, name: str):
+        if not self.url:
+            return
         now = time.time()
         if now - self.last.get(cid, 0.0) < self.cfg.pi_cooldown:
             return
@@ -662,14 +672,17 @@ class PiLink(threading.Thread):
             headers = {"Content-Type": "application/json"}
             if self.cfg.face_token:
                 headers["X-Auth-Token"] = self.cfg.face_token
-            req = urllib.request.Request(self.cfg.pi_face_url, data=body, headers=headers, method="POST")
+            url = self.url
+            if not url:
+                continue
+            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
             try:
                 with urllib.request.urlopen(req, timeout=2) as r:
                     r.read()
                 self.state.pi_ok = True
             except Exception as e:
                 self.state.pi_ok = False
-                log.warning("[Pi] %s unreachable: %s", self.cfg.pi_face_url, e)
+                log.warning("[Pi] %s unreachable: %s", url, e)
 
 
 # ── Database thread (all network I/O off the camera loop) ─────────────────────
@@ -832,7 +845,8 @@ class Database(threading.Thread):
                        "width": cam.size[0], "height": cam.size[1]},
             "cameras": [{**c, "role": "face"} for c in list_cameras()],
             "roles": ["face"],
-            "pi": {"url": self.cfg.pi_face_url, "ok": st.pi_ok},
+            "pi": {"url": self.engine.pi.url if self.engine.pi else "", "mode": self.engine.pi.mode if self.engine.pi else "",
+                   "ok": st.pi_ok},
             "uptime_s": int(time.time() - st.started),
             "last_decision": None if d is None else {"state": d.state, "score": round(d.score, 3),
                                                      "at": utc_iso(d.t)},
@@ -850,6 +864,37 @@ class Database(threading.Thread):
         if src != self.sources_seen:
             self.sources_seen = src
             self.camera.switch(src)
+        self._pi_address()
+
+    def _pi_address(self):
+        """
+        Where to send face events. CRM setting `network` (Perangkat -> Alamat Raspberry Pi):
+          auto   : the address the Pi itself reports in its heartbeat (follows Wi-Fi/IP changes)
+          manual : the URL typed in the CRM
+          env    : PI_FACE_URL from .env (default when nothing is set in the CRM)
+        """
+        pi = self.engine.pi
+        if pi is None:
+            return
+        row = self._q("SELECT value FROM app_settings WHERE key = 'network'", (), "one")
+        net = row[0] if row and isinstance(row[0], dict) else {}
+        env_url = "" if self.cfg.pi_face_url.lower() in ("", "auto") else self.cfg.pi_face_url
+        mode = net.get("pi_face_mode") or ("env" if env_url else "auto")
+        url = pi.url
+        if mode == "manual" and str(net.get("pi_face_url") or "").startswith("http"):
+            url = str(net["pi_face_url"]).strip()
+        elif mode == "env" and env_url:
+            url = env_url
+        elif mode == "auto":
+            r = self._q("""SELECT info->'network'->>'lan_ip', info->'network'->>'face_port' FROM device_status
+                           WHERE kind = 'persontrack' AND last_seen_at > NOW() - INTERVAL '60 seconds'
+                           ORDER BY last_seen_at DESC LIMIT 1""", (), "one")
+            if r and r[0]:
+                url = f"http://{r[0]}:{r[1] or 8765}/wajah"
+        if url != pi.url or mode != pi.mode:
+            log.info("[Pi] face events -> %s (%s)", url or "-", mode)
+            pi.url, pi.mode = url, mode
+            self.state.pi_ok = None
 
     def _commands(self):
         row = self._q("""UPDATE device_commands SET status = 'RUNNING', started_at = NOW()
@@ -902,12 +947,14 @@ class Database(threading.Thread):
         if g["legacy"]:
             add("Wajah model lama", None, f"{g['legacy']} pelanggan perlu didaftarkan ulang", "Buka Wajah Terdaftar.")
         add("Database", True, "terhubung")
-        if self.cfg.pi_face_url:
+        pi_url = self.engine.pi.url if self.engine.pi else ""
+        if pi_url:
             add("Raspberry Pi", st.pi_ok if st.pi_ok is not None else None,
-                self.cfg.pi_face_url + (" (belum ada kiriman)" if st.pi_ok is None else ""),
-                "Periksa PI_FACE_URL dan FACE_TOKEN di .env UNO Q dan Pi.")
+                pi_url + (" (belum ada kiriman)" if st.pi_ok is None else ""),
+                "Periksa Alamat Raspberry Pi (Perangkat) dan FACE_TOKEN yang sama di UNO Q dan Pi.")
         else:
-            add("Raspberry Pi", None, "PI_FACE_URL belum diisi", "Tanpa ini nama tidak ikut pada pelacakan.")
+            add("Raspberry Pi", None, "alamat belum diketahui",
+                "Nyalakan Raspberry Pi; atau isi Alamat Raspberry Pi di halaman Perangkat.")
         db_now = self._q("SELECT EXTRACT(EPOCH FROM NOW())", (), "one")[0]
         skew = abs(float(db_now) - time.time())
         add("Jam papan", skew < 5 or None, f"selisih {skew:.1f} detik dari server",
@@ -917,15 +964,22 @@ class Database(threading.Thread):
 
     def _frames(self):
         key = f"{self.cfg.device_id}/face"
-        row = self._q("SELECT wanted_until > NOW() FROM device_frames WHERE camera_key = %s", (key,), "one")
-        if not row or not row[0]:
+        now = time.time()
+        if now >= self.next["watch_check"]:            # is a CRM page watching? (asked once a second)
+            self.next["watch_check"] = now + 1.0
+            row = self._q("SELECT GREATEST(0, EXTRACT(EPOCH FROM wanted_until - NOW())) FROM device_frames "
+                          "WHERE camera_key = %s", (key,), "one")
+            self.watch_until = now + float(row[0]) if row and row[0] is not None else 0.0
+        if now >= getattr(self, "watch_until", 0.0):
             return
         with self.state.lock:
             img = None if self.state.preview is None else self.state.preview.copy()
             view = dict(self.state.view)
         if img is None:
             return
-        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 65])
+        if img.shape[1] > 480:                         # preview only: small frames upload fast on a hotspot
+            img = cv2.resize(img, (480, int(img.shape[0] * 480 / img.shape[1])), interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 60])
         if not ok:
             return
         self._q("""UPDATE device_frames SET device_id = %s, camera = 'face', jpeg_b64 = %s, width = %s, height = %s,
@@ -947,7 +1001,7 @@ class Database(threading.Thread):
                 for name, every, fn in (("enrollment", 1.0, self._poll_enroll),
                                         ("commands", 1.5, self._commands),
                                         ("settings", 5.0, self._settings),
-                                        ("frames", 1.0, self._frames),
+                                        ("frames", 0.25, self._frames),
                                         ("heartbeat", self.cfg.heartbeat_sec, self._heartbeat)):
                     if now >= self.next[name]:
                         self.next[name] = now + every
@@ -1045,8 +1099,20 @@ class Engine:
             s.t0 = now
         s.samples.append(Sample(q, e))
         s.t_last = now
+        if 0 < self.cfg.early_frames <= len(s.samples) < self.cfg.session_frames and self._strong(s):
+            self._close_session(now)
+            return
         if len(s.samples) >= self.cfg.session_frames or now - s.t0 >= self.cfg.session_max_sec:
             self._close_session(now)
+
+    def _strong(self, s: Session) -> bool:
+        d = decide(self.cfg, self.gallery, s)
+        if d.state != "known":
+            return False
+        agree, total = (int(x) for x in d.votes.split("/"))
+        # at least 3 DISTINCT frames (a perfectly still face gives near-identical frames, which best() merges)
+        return (total >= 3 and agree == total and d.score >= self.cfg.match_threshold + 0.10
+                and d.margin >= 2 * self.cfg.match_margin)
 
     def _close_session(self, now: float):
         s, self.sess = self.sess, Session()
@@ -1178,11 +1244,8 @@ def main():
             log.warning("[Gallery] not loaded yet (database unreachable?) -- starting anyway")
     else:
         log.warning("DATABASE_URL is empty: offline mode, nobody can be recognised or enrolled")
-    if cfg.pi_face_url:
-        engine.pi = PiLink(cfg, state)
-        engine.pi.start()
-    else:
-        log.warning("PI_FACE_URL is empty: names will not be linked to the person tracking")
+    engine.pi = PiLink(cfg, state)       # address may also come from the CRM / the Pi's heartbeat
+    engine.pi.start()
     camera.start()
     server = ThreadingHTTPServer((cfg.local_host, cfg.local_port), http_handler(state, engine, cfg))
     server.daemon_threads = True
