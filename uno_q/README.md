@@ -71,3 +71,34 @@ page *Wajah Terdaftar* lists them for re-enrollment.
 | Jam papan: selisih | `sudo timedatectl set-ntp true` (needs Wi‑Fi) |
 | Customer always "not sure" | re-enroll in good light; check the camera is at face height, 0.5–1.5 m |
 | Log: `Illegal instruction` | something imported onnxruntime; this program does not — use `facerec_uno_q.py` |
+
+## Kamera real-time (sekali pasang)
+
+Tampilan kamera di CRM datang langsung dari perangkat ini lewat WebSocket (`livecast.py`), bukan
+lewat Supabase: halus (hingga 15 gambar/detik), jeda kecil, dan tidak memakai kuota Supabase.
+Alamat HTTPS-nya dibuat oleh **cloudflared** (gratis, tanpa akun, Cloudflare Quick Tunnel).
+Pasang sekali di perangkat ini:
+
+```
+curl -L -o ~/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64
+chmod +x ~/cloudflared
+~/cloudflared --version
+```
+
+Program menjalankan cloudflared sendiri (dicari di `~/cloudflared`, `/usr/local/bin`, atau `CLOUDFLARED=`),
+membaca alamat `https://….trycloudflare.com`, dan mengirimnya lewat heartbeat. Alamat berganti setiap
+program dimulai ulang; CRM selalu memakai yang terbaru. Cek di CRM → Perangkat → "Kamera real-time".
+Tanpa cloudflared, CRM memakai jalur cadangan (Supabase Realtime, dibatasi `STREAM_MONTHLY_MB`, lalu
+gambar tersimpan) yang lebih lambat.
+
+| `.env` | Bawaan | Arti |
+|---|---|---|
+| `LIVE_FPS` | 15 | gambar/detik paling banyak (pilihan "Halus"; "Hemat data" = 6) |
+| `LIVE_WIDTH` | 640 | lebar gambar paling besar |
+| `LIVE_PORT` | 8771 | port lokal (127.0.0.1 saja) |
+| `LIVE_TUNNEL` | 1 | 0 = tanpa cloudflared |
+| `LIVE_PUBLIC_URL` | – | alamat HTTPS tetap sendiri (mis. named tunnel) sebagai pengganti quick tunnel |
+
+Pemakaian data internet hanya saat ada yang menonton: "Halus" ±1–2 GB/jam per kamera yang ramai,
+"Hemat data" ±0,4–0,6 GB/jam. Tab disembunyikan = berhenti.
+

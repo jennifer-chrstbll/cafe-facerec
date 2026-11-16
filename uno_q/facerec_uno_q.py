@@ -37,7 +37,12 @@ import json
 import logging
 import os
 import queue
+import re
+import secrets
+import shutil
 import socket
+import struct
+import subprocess
 import sys
 import threading
 import time
@@ -45,7 +50,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
@@ -120,7 +125,12 @@ class Config:
     reload_interval: float = _env("RELOAD_INTERVAL", 120.0, float)
     heartbeat_sec: float = _env("HEARTBEAT_SEC", 10.0, float)
     stream_fps: float = _env("STREAM_FPS", 10.0, float)      # live pictures to the CRM while watched
-    stream_monthly_max: int = _env("STREAM_MONTHLY_MAX", 450_000, int)   # Realtime pictures/month (0 = no cap)
+    stream_monthly_mb: float = _env("STREAM_MONTHLY_MB", 300.0, float)  # fallback Realtime MB/month (0 = no cap)
+    live_port: int = _env("LIVE_PORT", 8771, int)          # real-time view, 127.0.0.1 only
+    live_fps: float = _env("LIVE_FPS", 15.0, float)
+    live_width: int = _env("LIVE_WIDTH", 640, int)
+    live_tunnel: bool = _env("LIVE_TUNNEL", 1, int) == 1   # cloudflared quick tunnel
+    live_public_url: str = _env("LIVE_PUBLIC_URL", "")     # own fixed https address instead of a quick tunnel
 
     pi_face_url: str = _env("PI_FACE_URL", "")               # http://<pi-ip>:8765/wajah, or "auto"
     face_token: str = _env("FACE_TOKEN", "")                 # same as FACE_TOKEN on the Pi
@@ -591,6 +601,20 @@ class Camera(threading.Thread):
         return False
 
     def run(self):
+        while True:                            # a camera error must never end this thread
+            try:
+                self._run()
+            except Exception as e:
+                log.warning("[Camera] error (%s), reopening in 1 s", e)
+                try:
+                    if self.cap is not None:
+                        self.cap.release()
+                except Exception:
+                    pass
+                self.cap, self.ok = None, False
+                time.sleep(1)
+
+    def _run(self):
         fails = 0
         while True:
             if self._switch.is_set():
@@ -697,13 +721,14 @@ class FrameStreamer(threading.Thread):
     IDLE_FPS = 2.0
 
     def __init__(self, source, fps: float = 8.0, max_width: int = 512, quality: int = 60,
-                 monthly_max: int = 450_000, budget_path: str | None = None):
+                 monthly_mb: float = 300.0, budget_path: str | None = None):
         """source() -> list of (camera_key, image, overlay, frame_key) for the cameras being watched."""
         super().__init__(daemon=True, name="stream")
         self.source, self.fps, self.max_width, self.quality = source, max(1.0, fps), max_width, quality
-        self.monthly_max, self.budget_path = monthly_max, budget_path
+        self.monthly_max, self.budget_path = int(monthly_mb * 1e6), budget_path
         self.month, self.used = self._load_budget()
         self.saved_used = self.used
+        self.budget_logged = False
         self.last_sent: dict = {}
         self.conf = None
         self.lock = threading.Lock()
@@ -731,7 +756,7 @@ class FrameStreamer(threading.Thread):
             with open(self.budget_path, encoding="utf-8") as f:
                 d = json.load(f)
             if d.get("month") == self._this_month():
-                return d["month"], int(d.get("sent", 0))
+                return d["month"], int(d.get("bytes", 0))
         except Exception:
             pass
         return self._this_month(), 0
@@ -743,7 +768,7 @@ class FrameStreamer(threading.Thread):
             os.makedirs(os.path.dirname(self.budget_path) or ".", exist_ok=True)
             tmp = self.budget_path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"month": self.month, "sent": self.used}, f)
+                json.dump({"month": self.month, "bytes": self.used}, f)
             os.replace(tmp, self.budget_path)
             self.saved_used = self.used
         except Exception:
@@ -752,18 +777,19 @@ class FrameStreamer(threading.Thread):
     def _budget_left(self) -> bool:
         m = self._this_month()
         if m != self.month:                       # new month: the quota starts again
-            self.month, self.used = m, 0
+            self.month, self.used, self.budget_logged = m, 0, False
         if self.monthly_max > 0 and self.used >= self.monthly_max:
-            if self.used == self.monthly_max:
-                log.warning("[Stream] monthly Realtime budget used (%d pictures); live view uses stored "
-                            "frames until next month (STREAM_MONTHLY_MAX)", self.used)
-                self.used += 1                    # log once
+            if not self.budget_logged:
+                log.warning("[Stream] monthly Realtime budget used (%.0f MB); the fallback view uses stored "
+                            "frames until next month (STREAM_MONTHLY_MB)", self.used / 1e6)
+                self.budget_logged = True
                 self._save_budget()
             return False
         return True
 
     def stats(self) -> dict:
-        return {"month": self.month, "sent": self.used, "max": self.monthly_max, "active": self.active}
+        return {"month": self.month, "mb": round(self.used / 1e6, 1), "max_mb": round(self.monthly_max / 1e6),
+                "active": self.active}
 
     @property
     def active(self) -> bool:
@@ -786,6 +812,7 @@ class FrameStreamer(threading.Thread):
         body = json.dumps({"messages": [{"topic": conf["topic"], "event": "frame", "payload": payload}]})
         self.conn.request("POST", "/realtime/v1/api/broadcast", body=body, headers={
             "apikey": conf["key"], "Authorization": f"Bearer {conf['key']}", "Content-Type": "application/json"})
+        self.used += len(body)
         r = self.conn.getresponse()
         r.read()
         if r.status >= 300:
@@ -825,7 +852,6 @@ class FrameStreamer(threading.Thread):
                     try:
                         self._post(conf, json.loads(json.dumps(payload, default=str)))
                         self.ok_at, self.fail = time.time(), 0
-                        self.used += 1
                     except Exception as e:
                         self._close()
                         self.fail += 1
@@ -835,6 +861,309 @@ class FrameStreamer(threading.Thread):
                             self.pause_until = time.time() + 10      # back off, then try again
                         break
             time.sleep(max(0.0, period - (time.time() - t0)))
+
+
+# ── Real-time camera view straight to the CRM browser (same as the Pi's livecast.py) ──
+# WebSocket through a cloudflared quick tunnel; no Supabase traffic. See livecast.py for details.
+
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+MAX_IN_FLIGHT = 2          # pictures sent but not yet shown by the browser
+
+
+class _WS:
+    """Minimal server side of RFC 6455 (binary/text out, ack/ping/close in)."""
+
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+        self.send_lock = threading.Lock()
+        self.closed = threading.Event()
+        self.acked = 0
+        self.ack_at = time.time()
+        self.ack_cond = threading.Condition()
+
+    def send(self, opcode: int, data: bytes):
+        n = len(data)
+        if n < 126:
+            head = struct.pack("!BB", 0x80 | opcode, n)
+        elif n < 65536:
+            head = struct.pack("!BBH", 0x80 | opcode, 126, n)
+        else:
+            head = struct.pack("!BBQ", 0x80 | opcode, 127, n)
+        with self.send_lock:
+            self.sock.sendall(head + data)
+
+    def _recv_exact(self, n: int) -> bytes:
+        buf = b""
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("closed")
+            buf += chunk
+        return buf
+
+    def reader(self):
+        try:
+            while not self.closed.is_set():
+                b1, b2 = self._recv_exact(2)
+                opcode, masked, n = b1 & 0x0F, b2 & 0x80, b2 & 0x7F
+                if n == 126:
+                    n = struct.unpack("!H", self._recv_exact(2))[0]
+                elif n == 127:
+                    n = struct.unpack("!Q", self._recv_exact(8))[0]
+                if n > 1 << 16:
+                    raise ConnectionError("message too large")
+                mask = self._recv_exact(4) if masked else b"\0\0\0\0"
+                data = bytes(c ^ mask[i % 4] for i, c in enumerate(self._recv_exact(n)))
+                if opcode == 0x8:                      # close
+                    break
+                if opcode == 0x9:                      # ping
+                    self.send(0xA, data)
+                elif opcode == 0x1:                    # text: acknowledgements
+                    with self.ack_cond:
+                        self.acked += data.count(b"a")
+                        self.ack_at = time.time()
+                        self.ack_cond.notify_all()
+        except Exception:
+            pass
+        finally:
+            self.closed.set()
+            with self.ack_cond:
+                self.ack_cond.notify_all()
+
+
+class Tunnel(threading.Thread):
+    """Keeps a cloudflared quick tunnel to 127.0.0.1:port running; .url is its HTTPS address."""
+
+    URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+
+    def __init__(self, port: int, binary: str = ""):
+        super().__init__(daemon=True, name="tunnel")
+        self.port, self.binary = port, binary
+        self.url: str | None = None
+        self.state = "starting"
+        self.proc: subprocess.Popen | None = None
+        self.found_at = 0.0
+
+    def find(self) -> str | None:
+        home = os.path.expanduser("~")
+        for c in (self.binary, os.environ.get("CLOUDFLARED", ""), shutil.which("cloudflared") or "",
+                  os.path.join(home, "cloudflared"), os.path.join(home, ".local", "bin", "cloudflared"),
+                  "/usr/local/bin/cloudflared", "/usr/bin/cloudflared"):
+            if c and os.path.isfile(c) and os.access(c, os.X_OK):
+                return c
+        return None
+
+    def run(self):
+        threading.Thread(target=self._watchdog, daemon=True, name="tunnel-check").start()
+        backoff, warned = 5, False
+        while True:
+            exe = self.find()
+            if not exe:
+                self.state = "cloudflared belum dipasang"
+                if not warned:
+                    log.warning("[Live] cloudflared not installed: the CRM uses the slower camera view "
+                                "(see README, 'Kamera real-time')")
+                    warned = True
+                time.sleep(60)
+                continue
+            try:
+                self.proc = subprocess.Popen(
+                    [exe, "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{self.port}"],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                self.state = "menghubungkan"
+                for line in self.proc.stdout:              # also drains the log so it never blocks
+                    m = self.URL_RE.search(line)
+                    if m and m.group(0) != self.url:
+                        self.url, self.state, self.found_at, backoff = m.group(0), "ok", time.time(), 5
+                        log.info("[Live] camera view online at %s", self.url)
+                self.proc.wait()
+            except Exception as e:
+                log.warning("[Live] cloudflared failed: %s", e)
+            self.url, self.state = None, "terputus, mencoba lagi"
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 120)
+
+    def _watchdog(self):
+        """A new address needs up to a minute to work; after that it must answer, or restart."""
+        fails = 0
+        while True:
+            time.sleep(60)
+            url, proc = self.url, self.proc
+            if not url or proc is None or time.time() - self.found_at < 90:
+                fails = 0
+                continue
+            try:
+                with urllib.request.urlopen(url + "/ping", timeout=10) as r:
+                    ok = r.status == 200
+            except Exception:
+                ok = False
+            fails = 0 if ok else fails + 1
+            if fails >= 3:
+                log.warning("[Live] %s does not answer, restarting cloudflared", url)
+                fails = 0
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+
+
+class LiveCast:
+    def __init__(self, source, port: int = 8770, fps: float = 15.0, max_width: int = 640,
+                 tunnel: bool = True, max_clients: int = 4, public_url: str = ""):
+        """source(camera) -> (raw_image, frame_number, overlay) | None. Called per frame per viewer."""
+        self.source, self.port = source, port
+        self.fps, self.max_width, self.max_clients = max(1.0, fps), max_width, max_clients
+        self.token = secrets.token_urlsafe(24)
+        self.public_url = public_url.rstrip("/")   # own fixed address (e.g. a named tunnel): no quick tunnel
+        self.tunnel = Tunnel(port) if tunnel and not self.public_url else None
+        self.clients = 0
+        self.lock = threading.Lock()
+        self.cache: dict = {}                  # camera -> (key, jpeg bytes, w, h)
+        self.sent = 0
+        self.bytes = 0
+
+    # ── public ──────────────────────────────────────────────────────────────
+    def start(self):
+        try:
+            srv = ThreadingHTTPServer(("127.0.0.1", self.port), self._handler())
+        except OSError as e:
+            log.error("[Live] port %d busy (%s): real-time camera view off", self.port, e)
+            return self
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True, name="live-http").start()
+        if self.tunnel:
+            self.tunnel.start()
+        return self
+
+    def info(self) -> dict:
+        """For the heartbeat: the CRM gives url + token to logged-in users only."""
+        url = self.public_url or (self.tunnel.url if self.tunnel else None)
+        state = "ok" if self.public_url else (self.tunnel.state if self.tunnel else "off")
+        return {"url": url, "token": self.token if url else None, "state": state,
+                "viewers": self.clients, "fps_max": self.fps, "sent": self.sent, "mb": round(self.bytes / 1e6, 1)}
+
+    # ── internals ───────────────────────────────────────────────────────────
+    def _jpeg(self, camera: str, img, seq, width: int, quality: int):
+        key = (seq, width, quality)
+        with self.lock:
+            hit = self.cache.get(camera)
+            if hit and hit[0] == key:
+                return hit[1], hit[2], hit[3]
+        h, w = img.shape[:2]
+        if w > width:
+            img = cv2.resize(img, (width, int(h * width / w)), interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        if not ok:
+            return None, 0, 0
+        out = (buf.tobytes(), img.shape[1], img.shape[0])
+        with self.lock:
+            self.cache[camera] = (key, *out)
+        return out
+
+    def _serve(self, ws: _WS, camera: str, fps: float, width: int, quality: int):
+        period, last_seq, last_sent, sent, idle_ping = 1.0 / fps, None, 0.0, 0, time.time()
+        while not ws.closed.is_set():
+            with ws.ack_cond:                  # at most MAX_IN_FLIGHT pictures on the way
+                if sent - ws.acked >= MAX_IN_FLIGHT:
+                    ws.ack_cond.wait(timeout=0.5)
+                    if sent - ws.acked >= MAX_IN_FLIGHT:
+                        if time.time() - ws.ack_at > 10:
+                            break               # the browser stopped answering
+                        continue
+            wait = period - (time.time() - last_sent)
+            if wait > 0:
+                time.sleep(wait)
+            try:
+                got = self.source(camera)
+            except Exception:
+                got = None
+            if got is None or got[1] == last_seq:
+                if time.time() - idle_ping > 15:               # keep proxies from closing the link
+                    ws.send(0x9, b"")
+                    idle_ping = time.time()
+                time.sleep(0.01)
+                continue
+            img, seq, overlay = got
+            jpg, w, h = self._jpeg(camera, img, seq, width, quality)
+            if jpg is None:
+                continue
+            head = json.dumps({"o": overlay, "w": w, "h": h, "s": seq, "t": int(time.time() * 1000)},
+                              default=str, separators=(",", ":")).encode()
+            ws.send(0x2, struct.pack("!I", len(head)) + head + jpg)
+            last_seq, last_sent, idle_ping = seq, time.time(), time.time()
+            sent += 1
+            self.sent += 1
+            self.bytes += len(jpg)
+
+    def _handler(self):
+        cast = self
+
+        class H(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def _plain(self, code: int, text: str):
+                b = text.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(b)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(b)
+
+            def do_GET(self):
+                u = urlparse(self.path)
+                if u.path == "/ping":
+                    return self._plain(200, "ok")
+                if u.path != "/live":
+                    return self._plain(404, "not found")
+                q = {k: v[0] for k, v in parse_qs(u.query).items()}
+                if not hmac.compare_digest(q.get("token", ""), cast.token):
+                    return self._plain(403, "forbidden")
+                key = self.headers.get("Sec-WebSocket-Key", "")
+                if "websocket" not in self.headers.get("Upgrade", "").lower() or not key:
+                    return self._plain(400, "websocket required")
+                if cast.clients >= cast.max_clients:
+                    return self._plain(503, "too many viewers")
+                camera = q.get("cam", "")
+                try:
+                    fps = min(cast.fps, max(1.0, float(q.get("fps", cast.fps))))
+                    width = min(cast.max_width, max(240, int(q.get("w", cast.max_width))))
+                    quality = min(85, max(30, int(q.get("q", 60))))
+                except ValueError:
+                    return self._plain(400, "bad parameters")
+                accept = base64.b64encode(hashlib.sha1((key + _WS_GUID).encode()).digest()).decode()
+                self.send_response(101, "Switching Protocols")
+                self.send_header("Upgrade", "websocket")
+                self.send_header("Connection", "Upgrade")
+                self.send_header("Sec-WebSocket-Accept", accept)
+                self.end_headers()
+                sock = self.connection
+                sock.settimeout(None)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                ws = _WS(sock)
+                with cast.lock:
+                    cast.clients += 1
+                log.info("[Live] viewer connected (%s, %.0f fps, %d px)", camera, fps, width)
+                threading.Thread(target=ws.reader, daemon=True, name="live-read").start()
+                try:
+                    cast._serve(ws, camera, fps, width, quality)
+                except Exception:
+                    pass
+                finally:
+                    ws.closed.set()
+                    with cast.lock:
+                        cast.clients -= 1
+                    try:
+                        ws.send(0x8, b"")
+                    except Exception:
+                        pass
+                    self.close_connection = True
+                    log.info("[Live] viewer left (%s)", camera)
+
+        return H
 
 
 def parse_vec(v) -> np.ndarray:
@@ -998,6 +1327,7 @@ class Database(threading.Thread):
             "pi": {"url": self.engine.pi.url if self.engine.pi else "", "mode": self.engine.pi.mode if self.engine.pi else "",
                    "ok": st.pi_ok},
             "uptime_s": int(time.time() - st.started),
+            "live": self.engine.live.info() if getattr(self.engine, "live", None) else None,
             "last_decision": None if d is None else {"state": d.state, "score": round(d.score, 3),
                                                      "at": utc_iso(d.t)},
         }
@@ -1414,23 +1744,43 @@ def main():
             img, view, seq = state.preview, dict(state.view), state.preview_seq
         return [] if img is None else [(f"{cfg.device_id}/face", img, view, seq)]
     engine.streamer = FrameStreamer(stream_source, fps=cfg.stream_fps, max_width=480, quality=60,
-                                    monthly_max=cfg.stream_monthly_max,
+                                    monthly_mb=cfg.stream_monthly_mb,
                                     budget_path=str(HERE / "data" / "stream_budget.json"))
     engine.streamer.start()
+
+    def live_source(_camera: str):
+        """Real-time view: newest RAW camera frame + the newest face boxes (drawn by the browser)."""
+        with camera.cond:
+            fr, fseq = camera.frame, camera.seq
+        if fr is None:
+            return None
+        with state.lock:
+            view = dict(state.view)
+        return fr, fseq, view
+    engine.live = LiveCast(live_source, port=cfg.live_port, fps=cfg.live_fps, max_width=cfg.live_width,
+                           tunnel=cfg.live_tunnel, public_url=cfg.live_public_url).start()
     camera.start()
     server = ThreadingHTTPServer((cfg.local_host, cfg.local_port), http_handler(state, engine, cfg))
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True, name="http").start()
     log.info("[HTTP] http://%s:%d/video_feed  /health", cfg.local_host, cfg.local_port)
 
-    seq, n, t_fps = 0, 0, time.time()
+    seq, n, t_fps, errors = 0, 0, time.time(), 0
     try:
         while True:
-            frame, seq = camera.latest(seq)
-            if frame is None:
+            frame, new_seq = camera.latest(seq)
+            if frame is None or new_seq == seq:   # no new picture (camera reconnecting)
                 continue
+            seq = new_seq
             now = time.time()
-            engine.step(frame, now)
+            try:
+                engine.step(frame, now)
+            except Exception:                  # one bad frame must not stop the cashier camera
+                errors += 1
+                if errors <= 5 or errors % 100 == 0:
+                    log.exception("[Engine] frame failed (%d so far), continuing", errors)
+                time.sleep(0.05)
+                continue
             n += 1
             if now - t_fps >= 2.0:
                 state.fps, n, t_fps = n / (now - t_fps), 0, now
