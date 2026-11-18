@@ -374,7 +374,13 @@ class MobileFaceNet:
 
 # ── Quality (from the board's titik_wajah.py, unchanged thresholds) ───────────
 
-MIN_WIDTH_REL = 0.10        # face width / image width
+# Face width / image width. Recognition: 0.075 (48 px of 640, about 1.6 m with a ~65 deg webcam).
+# Measured on the dataset with probes shrunk to that size (noise, MJPEG, landmark error added):
+# the person's own score stays >= 0.58 for 95 % of probes while the best other person never
+# exceeds 0.38 at any size, so tau = 0.40 keeps its margin. Enrolment stays close (0.10, ~1.2 m):
+# the stored templates are the best photos.
+MIN_WIDTH_REL = 0.075
+ENROLL_MIN_WIDTH_REL = 0.10
 MIN_DET = 0.5
 MAX_YAW = 0.45              # beyond this the face is practically in profile
 MIN_SHARP = 6.0
@@ -488,6 +494,21 @@ class Gallery:
 class Sample:
     q: float
     emb: np.ndarray          # vault-protected
+    geo: Optional[tuple] = None   # (centre x, width) of the face as fractions of the image width
+
+
+def face_geo(frame: np.ndarray, face: "Face") -> tuple:
+    w = frame.shape[1]
+    x1, _, x2, _ = [float(v) for v in face.box]
+    return ((x1 + x2) / 2.0 / w, max(x2 - x1, 1.0) / w)
+
+
+def median_geo(samples: list) -> Optional[dict]:
+    """Where the recognised face was (sent to the Pi to tell apart two people at the cashier)."""
+    g = [x.geo for x in samples if x.geo]
+    if not g:
+        return None
+    return {"cx": round(float(np.median([a for a, _ in g])), 4), "w": round(float(np.median([b for _, b in g])), 4)}
 
 
 class Session:
@@ -682,7 +703,7 @@ class PiLink(threading.Thread):
         self.q: queue.Queue = queue.Queue(maxsize=20)
         self.last: dict[str, float] = {}
 
-    def send(self, cid: str, score: float, name: str):
+    def send(self, cid: str, score: float, name: str, face: Optional[dict] = None):
         if not self.url:
             return
         now = time.time()
@@ -692,7 +713,7 @@ class PiLink(threading.Thread):
         try:
             self.q.put_nowait({"customer_id": cid, "score": round(float(score), 4), "label": name[:40],
                                "camera_id": self.cfg.area_camera, "zone_id": "TITIK_KASIR",
-                               "face_camera": self.cfg.device_id})
+                               "face_camera": self.cfg.device_id, **({"face": face} if face else {})})
         except queue.Full:
             pass
 
@@ -1585,7 +1606,7 @@ class Engine:
             s = self.sess
         if not s.samples:
             s.t0 = now
-        s.samples.append(Sample(q, e))
+        s.samples.append(Sample(q, e, face_geo(frame, face)))
         s.t_last = now
         if 0 < self.cfg.early_frames <= len(s.samples) < self.cfg.session_frames and self._strong(s):
             self._close_session(now)
@@ -1613,7 +1634,7 @@ class Engine:
             self.flash(f"{name or d.customer_id[:8]} ({d.score:.2f})")
             log.info("[KNOWN] %s score=%.3f margin=%.3f votes=%s frames=%d", name, d.score, d.margin, d.votes, d.n)
             if self.pi:
-                self.pi.send(d.customer_id, d.score, name)
+                self.pi.send(d.customer_id, d.score, name, median_geo(s.samples))
             if now - self.last_known.get(d.customer_id, 0.0) >= self.cfg.known_log_cooldown:
                 self.last_known[d.customer_id] = now
                 if self.db:
@@ -1638,7 +1659,10 @@ class Engine:
             return self._end_enroll(False, msg)
         if q is None:
             return
-        s.samples.append(Sample(q, self.embed(frame, face)))
+        if face_geo(frame, face)[1] < ENROLL_MIN_WIDTH_REL:
+            self.flash("Mendekat sedikit ke kamera", 1.0)
+            return
+        s.samples.append(Sample(q, self.embed(frame, face), face_geo(frame, face)))
         if len(s.samples) < self.cfg.enroll_frames:
             return
         keep = s.best(self.cfg.enroll_keep)
@@ -1650,6 +1674,10 @@ class Engine:
         if other is not None and score >= self.cfg.match_threshold:
             return self._end_enroll(False, f"Wajah ini sudah terdaftar sebagai {self.gallery.name(other) or 'pelanggan lain'}.")
         self._end_enroll(True, "OK", [k.emb for k in keep])
+        if self.pi:
+            # The new customer is standing in front of the camera right now: tell the Pi at once,
+            # so the name is attached to their body without waiting for the next recognition.
+            self.pi.send(cid, 1.0, "", median_geo(s.samples[-10:]))
 
     def _preview(self, frame, faces, face, q, reason, now):
         view = {"faces": [], "status": "", "enrolling": self.enroll_req is not None}
