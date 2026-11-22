@@ -586,6 +586,8 @@ class Camera(threading.Thread):
 
     def _open(self) -> bool:
         src = self.source
+        if src.startswith("/dev/") and not sys.platform.startswith("linux"):
+            src = ""                           # board camera chosen in the CRM, running on a laptop: own webcam
         candidates: list = []
         if src == "":
             candidates = [c["source"] for c in list_cameras()] or list(range(5))
@@ -1207,120 +1209,157 @@ VIEWER_HTML = r"""<!doctype html>
 <title>Kamera</title>
 <style>
 html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,Segoe UI,Arial,sans-serif}
-canvas{display:block;width:100vw;height:100vh;cursor:pointer}
-</style></head><body><canvas id="c" title="Klik dua kali: penuhi jendela / tampil utuh"></canvas>
+#g{display:grid;gap:3px;width:100vw;height:100vh}
+canvas{display:block;width:100%;height:100%;min-width:0;min-height:0;cursor:pointer;background:#000}
+</style></head><body><div id="g"></div>
 <script>
-// Local camera view for recording: straight from the device over the cafe Wi-Fi (no internet data).
-// Light by default (480 px, quality 55, 12 fps) so a weak Wi-Fi link or a busy device still keeps up.
-// Everything drawn (labels, bars) scales with the window, so small side-by-side windows stay readable.
+// Local camera view for recording: straight from the devices over the cafe Wi-Fi (no internet data).
+// One camera:  /lihat?cam=CAM_1&token=..&name=..
+// Several cameras (also from other devices) in ONE window: /lihat?src=[{"u":"http://ip:port","c":"CAM_1","t":"token","n":"name"},..]
+// The tiles are arranged to be as large as possible for the window shape; text scales with each tile.
+// Light by default (480 px, quality 55, 12 fps) so a weak Wi-Fi link or a busy device keeps up.
+// Double-click: fill each tile (edges cut) or show the whole picture.
 const q = new URLSearchParams(location.search);
-const cam = q.get("cam") || "", token = q.get("token") || "", title = q.get("name") || cam;
 const fps = q.get("fps") || "12", width = q.get("w") || "480", quality = q.get("q") || "55";
-document.title = title || "Kamera";
-const cv = document.getElementById("c"), ctx = cv.getContext("2d");
-let since = performance.now(), shown = [], got = [], status = "Menghubungkan...", lastHead = null, lastImg = null;
-let cover = localStorage.getItem("lihat-cover") === "1";     // fill the window (edges cut) or show all
+let sources = [];
+try { sources = JSON.parse(q.get("src") || "[]"); } catch (e) { sources = []; }
+if (!sources.length) sources = [{ u: location.origin, c: q.get("cam") || "", t: q.get("token") || "", n: q.get("name") || q.get("cam") || "Kamera" }];
+document.title = sources.length > 1 ? `Kamera (${sources.length})` : sources[0].n;
+let cover = localStorage.getItem("lihat-cover") === "1";
+const grid = document.getElementById("g");
 const pad = (n, k = 2) => String(n).padStart(k, "0");
 const clock = (ms) => { const d = new Date(ms); return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`; };
-function fit() { cv.width = innerWidth * devicePixelRatio; cv.height = innerHeight * devicePixelRatio; if (lastImg) draw(lastImg, lastHead); else message(status); }
-addEventListener("resize", fit);
-cv.addEventListener("dblclick", () => { cover = !cover; localStorage.setItem("lihat-cover", cover ? "1" : "0"); fit(); });
-function label(x, y, text, bg, u) {
-  ctx.font = `bold ${Math.round(u)}px system-ui,Arial`;
-  const w = ctx.measureText(text).width + u * 0.6, h = u * 1.4;
-  y = Math.max(y, h);
-  ctx.fillStyle = bg; ctx.fillRect(x, y - h, w, h);
-  ctx.fillStyle = "#fff"; ctx.fillText(text, x + u * 0.3, y - u * 0.35);
+
+function layout() {                                  // columns x rows giving the largest 4:3 tiles
+  const n = sources.length, W = innerWidth, H = innerHeight;
+  let best = [1, n], area = 0;
+  for (let c = 1; c <= n; c++) {
+    const r = Math.ceil(n / c), s = Math.min(W / c / 4, H / r / 3);
+    if (s > area) { area = s; best = [c, r]; }
+  }
+  grid.style.gridTemplateColumns = `repeat(${best[0]}, minmax(0,1fr))`;
+  grid.style.gridTemplateRows = `repeat(${best[1]}, minmax(0,1fr))`;
 }
-function draw(img, head) {
-  lastImg = img; lastHead = head;
-  const W = cv.width, H = cv.height;
-  const s = cover ? Math.max(W / img.width, H / img.height) : Math.min(W / img.width, H / img.height);
-  const iw = img.width * s, ih = img.height * s, ox = (W - iw) / 2, oy = (H - ih) / 2;
-  // visible part of the picture (differs from the picture when it is cut to fill the window)
-  const vx = Math.max(ox, 0), vy = Math.max(oy, 0), vw = Math.min(iw, W), vh = Math.min(ih, H);
-  const u = Math.max(9 * devicePixelRatio, Math.min(16 * devicePixelRatio, vw / 42, vh / 22));   // text size
-  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, H);
-  ctx.drawImage(img, ox, oy, iw, ih);
-  const X = (f) => ox + f * iw, Y = (f) => oy + f * ih, o = (head && head.o) || {}, L = o.layout || {};
-  const lw = Math.max(1, u / 7);
-  ctx.lineWidth = lw;
-  const rect = (r, stroke, fill) => { ctx.fillStyle = fill; ctx.strokeStyle = stroke;
-    ctx.fillRect(X(r.x1), Y(r.y1), X(r.x2) - X(r.x1), Y(r.y2) - Y(r.y1)); ctx.strokeRect(X(r.x1), Y(r.y1), X(r.x2) - X(r.x1), Y(r.y2) - Y(r.y1)); };
-  (L.staff || []).forEach((r) => rect(r, "#f59e0b", "rgba(245,158,11,.18)"));
-  (L.exit || []).forEach((r) => rect(r, "#0ea5e9", "rgba(14,165,233,.18)"));
-  (L.transition || []).forEach((r) => rect(r, "#a3e635", "rgba(163,230,53,.12)"));
-  if (L.cashier) {
-    ctx.strokeStyle = "#22c55e"; ctx.fillStyle = "rgba(34,197,94,.15)";
-    ctx.beginPath(); ctx.arc(X(L.cashier.x), Y(L.cashier.y), L.cashier.r * iw, 0, 7); ctx.fill(); ctx.stroke();
+
+class Tile {
+  constructor(src) {
+    this.src = src; this.cv = document.createElement("canvas"); grid.appendChild(this.cv);
+    this.ctx = this.cv.getContext("2d"); this.shown = []; this.got = []; this.since = performance.now();
+    this.img = null; this.head = null; this.status = "Menghubungkan...";
+    this.cv.title = "Klik dua kali: penuhi kotak / tampil utuh";
+    new ResizeObserver(() => this.fit()).observe(this.cv);
+    this.connect();
   }
-  if (L.facecam) {
-    const k = u * 0.4;
-    ctx.fillStyle = "#8b5cf6"; ctx.fillRect(X(L.facecam.x) - k, Y(L.facecam.y) - k, 2 * k, 2 * k);
-    if (L.cashier) { ctx.strokeStyle = "#8b5cf6"; ctx.setLineDash([u * 0.5, u * 0.4]); ctx.beginPath(); ctx.moveTo(X(L.facecam.x), Y(L.facecam.y)); ctx.lineTo(X(L.cashier.x), Y(L.cashier.y)); ctx.stroke(); ctx.setLineDash([]); }
+  fit() {
+    const r = this.cv.getBoundingClientRect();
+    this.cv.width = Math.max(1, Math.round(r.width * devicePixelRatio)); this.cv.height = Math.max(1, Math.round(r.height * devicePixelRatio));
+    if (this.img) this.draw(this.img, this.head, false); else this.message(this.status);
   }
-  for (const p of o.people || []) {
-    const [x1, y1, x2, y2] = p.box, col = p.staff ? "#f59e0b" : p.customer_id ? "#22c55e" : "#3b82f6";
-    ctx.strokeStyle = col; ctx.lineWidth = lw * 1.5; ctx.strokeRect(X(x1), Y(y1), X(x2) - X(x1), Y(y2) - Y(y1));
-    const id = String(p.id || "").split(":").pop();
-    const who = p.staff ? "Staf" : p.customer_id ? (p.name || "Pelanggan") + (p.mode === "MANUAL" ? " (manual)" : "") : "?";
-    label(X(x1), Y(y1), `${who} · ${id}`, col, u);
+  label(x, y, text, bg, u) {
+    const ctx = this.ctx; ctx.font = `bold ${Math.round(u)}px system-ui,Arial`;
+    const w = ctx.measureText(text).width + u * 0.6, h = u * 1.4;
+    y = Math.max(y, h);
+    ctx.fillStyle = bg; ctx.fillRect(x, y - h, w, h);
+    ctx.fillStyle = "#fff"; ctx.fillText(text, x + u * 0.3, y - u * 0.35);
   }
-  for (const f of o.faces || []) {
-    const [x1, y1, x2, y2] = f.box; ctx.strokeStyle = f.main ? "#22c55e" : "#9ca3af"; ctx.lineWidth = lw * 1.5;
-    ctx.strokeRect(X(x1), Y(y1), X(x2) - X(x1), Y(y2) - Y(y1));
+  draw(img, head, fresh = true) {
+    this.img = img; this.head = head;
+    const ctx = this.ctx, W = this.cv.width, H = this.cv.height;
+    const s = cover ? Math.max(W / img.width, H / img.height) : Math.min(W / img.width, H / img.height);
+    const iw = img.width * s, ih = img.height * s, ox = (W - iw) / 2, oy = (H - ih) / 2;
+    const vx = Math.max(ox, 0), vy = Math.max(oy, 0), vw = Math.min(iw, W), vh = Math.min(ih, H);
+    const u = Math.max(9 * devicePixelRatio, Math.min(16 * devicePixelRatio, vw / 42, vh / 22));   // text size
+    ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, H);
+    ctx.drawImage(img, ox, oy, iw, ih);
+    const X = (f) => ox + f * iw, Y = (f) => oy + f * ih, o = (head && head.o) || {}, L = o.layout || {};
+    const lw = Math.max(1, u / 7);
+    ctx.lineWidth = lw;
+    const rect = (r, stroke, fill) => { ctx.fillStyle = fill; ctx.strokeStyle = stroke;
+      ctx.fillRect(X(r.x1), Y(r.y1), X(r.x2) - X(r.x1), Y(r.y2) - Y(r.y1)); ctx.strokeRect(X(r.x1), Y(r.y1), X(r.x2) - X(r.x1), Y(r.y2) - Y(r.y1)); };
+    (L.staff || []).forEach((r) => rect(r, "#f59e0b", "rgba(245,158,11,.18)"));
+    (L.exit || []).forEach((r) => rect(r, "#0ea5e9", "rgba(14,165,233,.18)"));
+    (L.transition || []).forEach((r) => rect(r, "#a3e635", "rgba(163,230,53,.12)"));
+    if (L.cashier) {
+      ctx.strokeStyle = "#22c55e"; ctx.fillStyle = "rgba(34,197,94,.15)";
+      ctx.beginPath(); ctx.arc(X(L.cashier.x), Y(L.cashier.y), L.cashier.r * iw, 0, 7); ctx.fill(); ctx.stroke();
+    }
+    if (L.facecam) {
+      const k = u * 0.4;
+      ctx.fillStyle = "#8b5cf6"; ctx.fillRect(X(L.facecam.x) - k, Y(L.facecam.y) - k, 2 * k, 2 * k);
+      if (L.cashier) { ctx.strokeStyle = "#8b5cf6"; ctx.setLineDash([u * 0.5, u * 0.4]); ctx.beginPath(); ctx.moveTo(X(L.facecam.x), Y(L.facecam.y)); ctx.lineTo(X(L.cashier.x), Y(L.cashier.y)); ctx.stroke(); ctx.setLineDash([]); }
+    }
+    for (const p of o.people || []) {
+      const [x1, y1, x2, y2] = p.box, col = p.staff ? "#f59e0b" : p.customer_id ? "#22c55e" : "#3b82f6";
+      ctx.strokeStyle = col; ctx.lineWidth = lw * 1.5; ctx.strokeRect(X(x1), Y(y1), X(x2) - X(x1), Y(y2) - Y(y1));
+      const id = String(p.id || "").split(":").pop();
+      const who = p.staff ? "Staf" : p.customer_id ? (p.name || "Pelanggan") + (p.mode === "MANUAL" ? " (manual)" : "") : "?";
+      this.label(X(x1), Y(y1), `${who} · ${id}`, col, u);
+    }
+    for (const f of o.faces || []) {
+      const [x1, y1, x2, y2] = f.box; ctx.strokeStyle = f.main ? "#22c55e" : "#9ca3af"; ctx.lineWidth = lw * 1.5;
+      ctx.strokeRect(X(x1), Y(y1), X(x2) - X(x1), Y(y2) - Y(y1));
+    }
+    const bar = u * 1.7;
+    if (o.status !== undefined && o.status !== "") {
+      ctx.font = `${Math.round(u * 1.05)}px system-ui,Arial`;
+      ctx.fillStyle = "rgba(0,0,0,.65)"; ctx.fillRect(vx, vy, vw, bar);
+      ctx.fillStyle = "#fff"; ctx.fillText(o.status, vx + u * 0.6, vy + bar - u * 0.5, vw - u * 1.2);
+    }
+    const now = performance.now();
+    if (fresh) this.shown.push(now);
+    while (this.shown.length && now - this.shown[0] > 2000) this.shown.shift();
+    while (this.got.length && now - this.got[0][0] > 2000) this.got.shift();
+    const span = Math.max(1000, Math.min(2000, now - this.since));          // ms counted (shorter just after connecting)
+    const rate = (this.shown.length * 1000 / span).toFixed(1);
+    const kbs = Math.round(this.got.reduce((a, g) => a + g[1], 0) * 1000 / span / 1024);
+    ctx.font = `bold ${Math.round(u)}px Consolas,monospace`;
+    const t = head ? clock(head.t) : "-";
+    let info = `${this.src.n} · ${rate} fps · ${kbs} KB/s · ${t}`;
+    if (ctx.measureText(info).width + u > vw) info = `${this.src.n} · ${rate} fps · ${t}`;
+    if (ctx.measureText(info).width + u > vw) info = `${rate} fps · ${t}`;
+    const bw = Math.min(vw, ctx.measureText(info).width + u);
+    ctx.fillStyle = "rgba(0,0,0,.65)"; ctx.fillRect(vx, vy + vh - bar, bw, bar);
+    ctx.fillStyle = "#fff"; ctx.fillText(info, vx + u * 0.5, vy + vh - u * 0.5);
   }
-  const bar = u * 1.7;
-  if (o.status !== undefined && o.status !== "") {
-    ctx.font = `${Math.round(u * 1.05)}px system-ui,Arial`;
-    ctx.fillStyle = "rgba(0,0,0,.65)"; ctx.fillRect(vx, vy, vw, bar);
-    ctx.fillStyle = "#fff"; ctx.fillText(o.status, vx + u * 0.6, vy + bar - u * 0.5, vw - u * 1.2);
+  message(text) {
+    this.status = text; if (this.img) return;
+    const ctx = this.ctx, cv = this.cv;
+    const u = Math.max(10 * devicePixelRatio, Math.min(18 * devicePixelRatio, cv.width / 30));
+    ctx.fillStyle = "#000"; ctx.fillRect(0, 0, cv.width, cv.height);
+    ctx.fillStyle = "#fff"; ctx.font = `${Math.round(u)}px system-ui,Arial`;
+    ctx.fillText(`${this.src.n}: ${text}`, u, u * 2, cv.width - 2 * u);
   }
-  const now = performance.now(); shown.push(now); while (shown.length && now - shown[0] > 2000) shown.shift();
-  while (got.length && now - got[0][0] > 2000) got.shift();
-  const span = Math.max(1000, Math.min(2000, now - since));          // ms counted (shorter just after connecting)
-  const rate = (shown.length * 1000 / span).toFixed(1);
-  const kbs = Math.round(got.reduce((a, g) => a + g[1], 0) * 1000 / span / 1024);
-  ctx.font = `bold ${Math.round(u)}px Consolas,monospace`;
-  const t = head ? clock(head.t) : "-";
-  let info = `${title} · ${rate} fps · ${kbs} KB/s · ${t}`;
-  if (ctx.measureText(info).width + u > vw) info = `${rate} fps · ${kbs} KB/s · ${t}`;
-  if (ctx.measureText(info).width + u > vw) info = `${rate} fps · ${t}`;
-  const bw = Math.min(vw, ctx.measureText(info).width + u);
-  ctx.fillStyle = "rgba(0,0,0,.65)"; ctx.fillRect(vx, vy + vh - bar, bw, bar);
-  ctx.fillStyle = "#fff"; ctx.fillText(info, vx + u * 0.5, vy + vh - u * 0.5);
+  connect() {
+    const s = this.src;
+    if (!s.t) { this.message("Token tidak ada. Buka dari Perangkat."); return; }
+    const base = s.u.replace(/^http/, "ws").replace(/\/$/, "");
+    const ws = new WebSocket(`${base}/live?cam=${encodeURIComponent(s.c)}&token=${encodeURIComponent(s.t)}&fps=${fps}&w=${width}&q=${quality}`);
+    ws.binaryType = "arraybuffer";
+    ws.onopen = () => { this.since = performance.now(); this.shown = []; this.got = []; this.message("Menunggu gambar..."); };
+    ws.onmessage = async (ev) => {
+      if (typeof ev.data === "string") return;
+      this.got.push([performance.now(), ev.data.byteLength]);
+      try {
+        const dv = new DataView(ev.data), n = dv.getUint32(0);
+        const head = JSON.parse(new TextDecoder().decode(new Uint8Array(ev.data, 4, n)));
+        const bmp = await createImageBitmap(new Blob([new Uint8Array(ev.data, 4 + n)], { type: "image/jpeg" }));
+        const old = this.img; this.draw(bmp, head);
+        if (old && old.close) old.close();
+      } catch (e) { /* skip a broken picture */ }
+      if (ws.readyState === 1) ws.send("a");          // shown: the device may send the next one
+    };
+    ws.onclose = (e) => {
+      const why = e.code === 1006 && !this.img ? "Tidak tersambung. Buka lagi dari Perangkat." : "Terputus, menyambung lagi...";
+      if (this.img && this.img.close) this.img.close();
+      this.img = null; this.message(why); setTimeout(() => this.connect(), 1500);
+    };
+    ws.onerror = () => ws.close();
+  }
 }
-function message(text) {
-  status = text; if (lastImg) return;
-  const u = Math.max(10 * devicePixelRatio, Math.min(18 * devicePixelRatio, cv.width / 30));
-  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, cv.width, cv.height);
-  ctx.fillStyle = "#fff"; ctx.font = `${Math.round(u)}px system-ui,Arial`; ctx.fillText(`${title}: ${text}`, u, u * 2, cv.width - 2 * u);
-}
-fit();
-function connect() {
-  if (!token) { message("Token tidak ada. Buka dari Perangkat."); return; }
-  const ws = new WebSocket(`ws://${location.host}/live?cam=${encodeURIComponent(cam)}&token=${encodeURIComponent(token)}&fps=${fps}&w=${width}&q=${quality}`);
-  ws.binaryType = "arraybuffer";
-  ws.onopen = () => { since = performance.now(); shown = []; got = []; message("Menunggu gambar..."); };
-  ws.onmessage = async (ev) => {
-    if (typeof ev.data === "string") return;
-    got.push([performance.now(), ev.data.byteLength]);
-    try {
-      const dv = new DataView(ev.data), n = dv.getUint32(0);
-      const head = JSON.parse(new TextDecoder().decode(new Uint8Array(ev.data, 4, n)));
-      const bmp = await createImageBitmap(new Blob([new Uint8Array(ev.data, 4 + n)], { type: "image/jpeg" }));
-      if (lastImg && lastImg.close) lastImg.close();
-      draw(bmp, head);
-    } catch (e) { /* skip a broken picture */ }
-    if (ws.readyState === 1) ws.send("a");          // shown: the device may send the next one
-  };
-  ws.onclose = (e) => {
-    const why = e.code === 1006 && !lastImg ? "Tidak tersambung. Buka lagi dari Perangkat." : "Terputus, menyambung lagi...";
-    lastImg = null; message(why); setTimeout(connect, 1500);
-  };
-  ws.onerror = () => ws.close();
-}
-connect();
+layout();
+const tiles = sources.map((s) => new Tile(s));
+addEventListener("resize", layout);
+addEventListener("dblclick", () => { cover = !cover; localStorage.setItem("lihat-cover", cover ? "1" : "0"); tiles.forEach((t) => t.fit()); });
 </script></body></html>
 """
 
