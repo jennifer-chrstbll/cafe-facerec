@@ -1207,33 +1207,43 @@ VIEWER_HTML = r"""<!doctype html>
 <title>Kamera</title>
 <style>
 html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,Segoe UI,Arial,sans-serif}
-canvas{display:block;width:100vw;height:100vh}
-</style></head><body><canvas id="c"></canvas>
+canvas{display:block;width:100vw;height:100vh;cursor:pointer}
+</style></head><body><canvas id="c" title="Klik dua kali: penuhi jendela / tampil utuh"></canvas>
 <script>
 // Local camera view for recording: straight from the device over the cafe Wi-Fi (no internet data).
+// Light by default (480 px, quality 55, 12 fps) so a weak Wi-Fi link or a busy device still keeps up.
+// Everything drawn (labels, bars) scales with the window, so small side-by-side windows stay readable.
 const q = new URLSearchParams(location.search);
 const cam = q.get("cam") || "", token = q.get("token") || "", title = q.get("name") || cam;
-const fps = q.get("fps") || "15", width = q.get("w") || "640", quality = q.get("q") || "70";
+const fps = q.get("fps") || "12", width = q.get("w") || "480", quality = q.get("q") || "55";
+document.title = title || "Kamera";
 const cv = document.getElementById("c"), ctx = cv.getContext("2d");
-let shown = [], status = "Menghubungkan...", lastHead = null, lastImg = null;
+let since = performance.now(), shown = [], got = [], status = "Menghubungkan...", lastHead = null, lastImg = null;
+let cover = localStorage.getItem("lihat-cover") === "1";     // fill the window (edges cut) or show all
 const pad = (n, k = 2) => String(n).padStart(k, "0");
 const clock = (ms) => { const d = new Date(ms); return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`; };
-function fit() { cv.width = innerWidth * devicePixelRatio; cv.height = innerHeight * devicePixelRatio; if (lastImg) draw(lastImg, lastHead); }
-addEventListener("resize", fit); fit();
-function label(x, y, text, bg) {
-  ctx.font = `bold ${Math.round(14 * devicePixelRatio)}px system-ui,Arial`;
-  const w = ctx.measureText(text).width + 8 * devicePixelRatio, h = 20 * devicePixelRatio;
+function fit() { cv.width = innerWidth * devicePixelRatio; cv.height = innerHeight * devicePixelRatio; if (lastImg) draw(lastImg, lastHead); else message(status); }
+addEventListener("resize", fit);
+cv.addEventListener("dblclick", () => { cover = !cover; localStorage.setItem("lihat-cover", cover ? "1" : "0"); fit(); });
+function label(x, y, text, bg, u) {
+  ctx.font = `bold ${Math.round(u)}px system-ui,Arial`;
+  const w = ctx.measureText(text).width + u * 0.6, h = u * 1.4;
+  y = Math.max(y, h);
   ctx.fillStyle = bg; ctx.fillRect(x, y - h, w, h);
-  ctx.fillStyle = "#fff"; ctx.fillText(text, x + 4 * devicePixelRatio, y - 5 * devicePixelRatio);
+  ctx.fillStyle = "#fff"; ctx.fillText(text, x + u * 0.3, y - u * 0.35);
 }
 function draw(img, head) {
   lastImg = img; lastHead = head;
-  const W = cv.width, H = cv.height, s = Math.min(W / img.width, H / img.height);
+  const W = cv.width, H = cv.height;
+  const s = cover ? Math.max(W / img.width, H / img.height) : Math.min(W / img.width, H / img.height);
   const iw = img.width * s, ih = img.height * s, ox = (W - iw) / 2, oy = (H - ih) / 2;
+  // visible part of the picture (differs from the picture when it is cut to fill the window)
+  const vx = Math.max(ox, 0), vy = Math.max(oy, 0), vw = Math.min(iw, W), vh = Math.min(ih, H);
+  const u = Math.max(9 * devicePixelRatio, Math.min(16 * devicePixelRatio, vw / 42, vh / 22));   // text size
   ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, H);
   ctx.drawImage(img, ox, oy, iw, ih);
   const X = (f) => ox + f * iw, Y = (f) => oy + f * ih, o = (head && head.o) || {}, L = o.layout || {};
-  const lw = 2 * devicePixelRatio;
+  const lw = Math.max(1, u / 7);
   ctx.lineWidth = lw;
   const rect = (r, stroke, fill) => { ctx.fillStyle = fill; ctx.strokeStyle = stroke;
     ctx.fillRect(X(r.x1), Y(r.y1), X(r.x2) - X(r.x1), Y(r.y2) - Y(r.y1)); ctx.strokeRect(X(r.x1), Y(r.y1), X(r.x2) - X(r.x1), Y(r.y2) - Y(r.y1)); };
@@ -1245,45 +1255,56 @@ function draw(img, head) {
     ctx.beginPath(); ctx.arc(X(L.cashier.x), Y(L.cashier.y), L.cashier.r * iw, 0, 7); ctx.fill(); ctx.stroke();
   }
   if (L.facecam) {
-    ctx.fillStyle = "#8b5cf6"; ctx.fillRect(X(L.facecam.x) - 6 * devicePixelRatio, Y(L.facecam.y) - 6 * devicePixelRatio, 12 * devicePixelRatio, 12 * devicePixelRatio);
-    if (L.cashier) { ctx.strokeStyle = "#8b5cf6"; ctx.setLineDash([8, 6]); ctx.beginPath(); ctx.moveTo(X(L.facecam.x), Y(L.facecam.y)); ctx.lineTo(X(L.cashier.x), Y(L.cashier.y)); ctx.stroke(); ctx.setLineDash([]); }
+    const k = u * 0.4;
+    ctx.fillStyle = "#8b5cf6"; ctx.fillRect(X(L.facecam.x) - k, Y(L.facecam.y) - k, 2 * k, 2 * k);
+    if (L.cashier) { ctx.strokeStyle = "#8b5cf6"; ctx.setLineDash([u * 0.5, u * 0.4]); ctx.beginPath(); ctx.moveTo(X(L.facecam.x), Y(L.facecam.y)); ctx.lineTo(X(L.cashier.x), Y(L.cashier.y)); ctx.stroke(); ctx.setLineDash([]); }
   }
   for (const p of o.people || []) {
     const [x1, y1, x2, y2] = p.box, col = p.staff ? "#f59e0b" : p.customer_id ? "#22c55e" : "#3b82f6";
-    ctx.strokeStyle = col; ctx.lineWidth = 3 * devicePixelRatio; ctx.strokeRect(X(x1), Y(y1), X(x2) - X(x1), Y(y2) - Y(y1));
+    ctx.strokeStyle = col; ctx.lineWidth = lw * 1.5; ctx.strokeRect(X(x1), Y(y1), X(x2) - X(x1), Y(y2) - Y(y1));
     const id = String(p.id || "").split(":").pop();
     const who = p.staff ? "Staf" : p.customer_id ? (p.name || "Pelanggan") + (p.mode === "MANUAL" ? " (manual)" : "") : "?";
-    label(X(x1), Y(y1), `${who} · ${id}`, col);
+    label(X(x1), Y(y1), `${who} · ${id}`, col, u);
   }
   for (const f of o.faces || []) {
-    const [x1, y1, x2, y2] = f.box; ctx.strokeStyle = f.main ? "#22c55e" : "#9ca3af"; ctx.lineWidth = 3 * devicePixelRatio;
+    const [x1, y1, x2, y2] = f.box; ctx.strokeStyle = f.main ? "#22c55e" : "#9ca3af"; ctx.lineWidth = lw * 1.5;
     ctx.strokeRect(X(x1), Y(y1), X(x2) - X(x1), Y(y2) - Y(y1));
   }
-  if (o.status !== undefined) {
-    ctx.fillStyle = "rgba(0,0,0,.7)"; ctx.fillRect(ox, oy, iw, 30 * devicePixelRatio);
-    ctx.fillStyle = "#fff"; ctx.font = `${Math.round(16 * devicePixelRatio)}px system-ui,Arial`;
-    ctx.fillText(o.status || "", ox + 10 * devicePixelRatio, oy + 21 * devicePixelRatio);
+  const bar = u * 1.7;
+  if (o.status !== undefined && o.status !== "") {
+    ctx.font = `${Math.round(u * 1.05)}px system-ui,Arial`;
+    ctx.fillStyle = "rgba(0,0,0,.65)"; ctx.fillRect(vx, vy, vw, bar);
+    ctx.fillStyle = "#fff"; ctx.fillText(o.status, vx + u * 0.6, vy + bar - u * 0.5, vw - u * 1.2);
   }
   const now = performance.now(); shown.push(now); while (shown.length && now - shown[0] > 2000) shown.shift();
-  const rate = shown.length > 1 ? ((shown.length - 1) * 1000 / (now - shown[0])).toFixed(1) : "0";
-  ctx.font = `bold ${Math.round(18 * devicePixelRatio)}px Consolas,monospace`;
-  const info = `${title}  ·  ${rate} fps  ·  jam perangkat ${head ? clock(head.t) : "-"}`;
-  const bw = ctx.measureText(info).width + 16 * devicePixelRatio;
-  ctx.fillStyle = "rgba(0,0,0,.75)"; ctx.fillRect(ox, oy + ih - 30 * devicePixelRatio, bw, 30 * devicePixelRatio);
-  ctx.fillStyle = "#fff"; ctx.fillText(info, ox + 8 * devicePixelRatio, oy + ih - 9 * devicePixelRatio);
+  while (got.length && now - got[0][0] > 2000) got.shift();
+  const span = Math.max(1000, Math.min(2000, now - since));          // ms counted (shorter just after connecting)
+  const rate = (shown.length * 1000 / span).toFixed(1);
+  const kbs = Math.round(got.reduce((a, g) => a + g[1], 0) * 1000 / span / 1024);
+  ctx.font = `bold ${Math.round(u)}px Consolas,monospace`;
+  const t = head ? clock(head.t) : "-";
+  let info = `${title} · ${rate} fps · ${kbs} KB/s · ${t}`;
+  if (ctx.measureText(info).width + u > vw) info = `${rate} fps · ${kbs} KB/s · ${t}`;
+  if (ctx.measureText(info).width + u > vw) info = `${rate} fps · ${t}`;
+  const bw = Math.min(vw, ctx.measureText(info).width + u);
+  ctx.fillStyle = "rgba(0,0,0,.65)"; ctx.fillRect(vx, vy + vh - bar, bw, bar);
+  ctx.fillStyle = "#fff"; ctx.fillText(info, vx + u * 0.5, vy + vh - u * 0.5);
 }
 function message(text) {
   status = text; if (lastImg) return;
+  const u = Math.max(10 * devicePixelRatio, Math.min(18 * devicePixelRatio, cv.width / 30));
   ctx.fillStyle = "#000"; ctx.fillRect(0, 0, cv.width, cv.height);
-  ctx.fillStyle = "#fff"; ctx.font = `${Math.round(20 * devicePixelRatio)}px system-ui,Arial`; ctx.fillText(text, 20, 40 * devicePixelRatio);
+  ctx.fillStyle = "#fff"; ctx.font = `${Math.round(u)}px system-ui,Arial`; ctx.fillText(`${title}: ${text}`, u, u * 2, cv.width - 2 * u);
 }
+fit();
 function connect() {
-  if (!token) { message("Token tidak ada. Buka tautan ini dari CRM > Perangkat."); return; }
+  if (!token) { message("Token tidak ada. Buka dari Perangkat."); return; }
   const ws = new WebSocket(`ws://${location.host}/live?cam=${encodeURIComponent(cam)}&token=${encodeURIComponent(token)}&fps=${fps}&w=${width}&q=${quality}`);
   ws.binaryType = "arraybuffer";
-  ws.onopen = () => message("Menunggu gambar...");
+  ws.onopen = () => { since = performance.now(); shown = []; got = []; message("Menunggu gambar..."); };
   ws.onmessage = async (ev) => {
     if (typeof ev.data === "string") return;
+    got.push([performance.now(), ev.data.byteLength]);
     try {
       const dv = new DataView(ev.data), n = dv.getUint32(0);
       const head = JSON.parse(new TextDecoder().decode(new Uint8Array(ev.data, 4, n)));
@@ -1293,7 +1314,10 @@ function connect() {
     } catch (e) { /* skip a broken picture */ }
     if (ws.readyState === 1) ws.send("a");          // shown: the device may send the next one
   };
-  ws.onclose = () => { message("Terputus, menyambung lagi..."); setTimeout(connect, 1500); };
+  ws.onclose = (e) => {
+    const why = e.code === 1006 && !lastImg ? "Tidak tersambung. Buka lagi dari Perangkat." : "Terputus, menyambung lagi...";
+    lastImg = null; message(why); setTimeout(connect, 1500);
+  };
   ws.onerror = () => ws.close();
 }
 connect();
