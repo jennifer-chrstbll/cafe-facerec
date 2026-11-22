@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import base64
 import collections
+import csv
 import glob
 import hashlib
 import hmac
@@ -131,6 +132,7 @@ class Config:
     live_width: int = _env("LIVE_WIDTH", 640, int)
     live_tunnel: bool = _env("LIVE_TUNNEL", 1, int) == 1   # cloudflared quick tunnel
     live_public_url: str = _env("LIVE_PUBLIC_URL", "")     # own fixed https address instead of a quick tunnel
+    live_bind: str = _env("LIVE_BIND", "0.0.0.0")          # 0.0.0.0 = local recording view on the Wi-Fi too
 
     pi_face_url: str = _env("PI_FACE_URL", "")               # http://<pi-ip>:8765/wajah, or "auto"
     face_token: str = _env("FACE_TOKEN", "")                 # same as FACE_TOKEN on the Pi
@@ -1030,11 +1032,13 @@ class Tunnel(threading.Thread):
 
 class LiveCast:
     def __init__(self, source, port: int = 8770, fps: float = 15.0, max_width: int = 640,
-                 tunnel: bool = True, max_clients: int = 4, public_url: str = ""):
+                 tunnel: bool = True, max_clients: int = 6, public_url: str = "", bind: str = "0.0.0.0",
+                 lan_ip=None):
         """source(camera) -> (raw_image, frame_number, overlay) | None. Called per frame per viewer."""
         self.source, self.port = source, port
         self.fps, self.max_width, self.max_clients = max(1.0, fps), max_width, max_clients
         self.token = secrets.token_urlsafe(24)
+        self.bind, self.lan_ip = bind, lan_ip
         self.public_url = public_url.rstrip("/")   # own fixed address (e.g. a named tunnel): no quick tunnel
         self.tunnel = Tunnel(port) if tunnel and not self.public_url else None
         self.clients = 0
@@ -1046,7 +1050,7 @@ class LiveCast:
     # ── public ──────────────────────────────────────────────────────────────
     def start(self):
         try:
-            srv = ThreadingHTTPServer(("127.0.0.1", self.port), self._handler())
+            srv = ThreadingHTTPServer((self.bind, self.port), self._handler())
         except OSError as e:
             log.error("[Live] port %d busy (%s): real-time camera view off", self.port, e)
             return self
@@ -1060,7 +1064,9 @@ class LiveCast:
         """For the heartbeat: the CRM gives url + token to logged-in users only."""
         url = self.public_url or (self.tunnel.url if self.tunnel else None)
         state = "ok" if self.public_url else (self.tunnel.state if self.tunnel else "off")
-        return {"url": url, "token": self.token if url else None, "state": state,
+        ip = self.lan_ip() if (self.lan_ip and self.bind != "127.0.0.1") else ""
+        lan = f"http://{ip}:{self.port}" if ip else None
+        return {"url": url, "lan": lan, "token": self.token if (url or lan) else None, "state": state,
                 "viewers": self.clients, "fps_max": self.fps, "sent": self.sent, "mb": round(self.bytes / 1e6, 1)}
 
     # ── internals ───────────────────────────────────────────────────────────
@@ -1138,6 +1144,15 @@ class LiveCast:
                 u = urlparse(self.path)
                 if u.path == "/ping":
                     return self._plain(200, "ok")
+                if u.path in ("/", "/lihat"):
+                    b = VIEWER_HTML.encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(b)
+                    return
                 if u.path != "/live":
                     return self._plain(404, "not found")
                 q = {k: v[0] for k, v in parse_qs(u.query).items()}
@@ -1185,6 +1200,149 @@ class LiveCast:
                     log.info("[Live] viewer left (%s)", camera)
 
         return H
+
+
+VIEWER_HTML = r"""<!doctype html>
+<html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kamera</title>
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,Segoe UI,Arial,sans-serif}
+canvas{display:block;width:100vw;height:100vh}
+</style></head><body><canvas id="c"></canvas>
+<script>
+// Local camera view for recording: straight from the device over the cafe Wi-Fi (no internet data).
+const q = new URLSearchParams(location.search);
+const cam = q.get("cam") || "", token = q.get("token") || "", title = q.get("name") || cam;
+const fps = q.get("fps") || "15", width = q.get("w") || "640", quality = q.get("q") || "70";
+const cv = document.getElementById("c"), ctx = cv.getContext("2d");
+let shown = [], status = "Menghubungkan...", lastHead = null, lastImg = null;
+const pad = (n, k = 2) => String(n).padStart(k, "0");
+const clock = (ms) => { const d = new Date(ms); return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`; };
+function fit() { cv.width = innerWidth * devicePixelRatio; cv.height = innerHeight * devicePixelRatio; if (lastImg) draw(lastImg, lastHead); }
+addEventListener("resize", fit); fit();
+function label(x, y, text, bg) {
+  ctx.font = `bold ${Math.round(14 * devicePixelRatio)}px system-ui,Arial`;
+  const w = ctx.measureText(text).width + 8 * devicePixelRatio, h = 20 * devicePixelRatio;
+  ctx.fillStyle = bg; ctx.fillRect(x, y - h, w, h);
+  ctx.fillStyle = "#fff"; ctx.fillText(text, x + 4 * devicePixelRatio, y - 5 * devicePixelRatio);
+}
+function draw(img, head) {
+  lastImg = img; lastHead = head;
+  const W = cv.width, H = cv.height, s = Math.min(W / img.width, H / img.height);
+  const iw = img.width * s, ih = img.height * s, ox = (W - iw) / 2, oy = (H - ih) / 2;
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, H);
+  ctx.drawImage(img, ox, oy, iw, ih);
+  const X = (f) => ox + f * iw, Y = (f) => oy + f * ih, o = (head && head.o) || {}, L = o.layout || {};
+  const lw = 2 * devicePixelRatio;
+  ctx.lineWidth = lw;
+  const rect = (r, stroke, fill) => { ctx.fillStyle = fill; ctx.strokeStyle = stroke;
+    ctx.fillRect(X(r.x1), Y(r.y1), X(r.x2) - X(r.x1), Y(r.y2) - Y(r.y1)); ctx.strokeRect(X(r.x1), Y(r.y1), X(r.x2) - X(r.x1), Y(r.y2) - Y(r.y1)); };
+  (L.staff || []).forEach((r) => rect(r, "#f59e0b", "rgba(245,158,11,.18)"));
+  (L.exit || []).forEach((r) => rect(r, "#0ea5e9", "rgba(14,165,233,.18)"));
+  (L.transition || []).forEach((r) => rect(r, "#a3e635", "rgba(163,230,53,.12)"));
+  if (L.cashier) {
+    ctx.strokeStyle = "#22c55e"; ctx.fillStyle = "rgba(34,197,94,.15)";
+    ctx.beginPath(); ctx.arc(X(L.cashier.x), Y(L.cashier.y), L.cashier.r * iw, 0, 7); ctx.fill(); ctx.stroke();
+  }
+  if (L.facecam) {
+    ctx.fillStyle = "#8b5cf6"; ctx.fillRect(X(L.facecam.x) - 6 * devicePixelRatio, Y(L.facecam.y) - 6 * devicePixelRatio, 12 * devicePixelRatio, 12 * devicePixelRatio);
+    if (L.cashier) { ctx.strokeStyle = "#8b5cf6"; ctx.setLineDash([8, 6]); ctx.beginPath(); ctx.moveTo(X(L.facecam.x), Y(L.facecam.y)); ctx.lineTo(X(L.cashier.x), Y(L.cashier.y)); ctx.stroke(); ctx.setLineDash([]); }
+  }
+  for (const p of o.people || []) {
+    const [x1, y1, x2, y2] = p.box, col = p.staff ? "#f59e0b" : p.customer_id ? "#22c55e" : "#3b82f6";
+    ctx.strokeStyle = col; ctx.lineWidth = 3 * devicePixelRatio; ctx.strokeRect(X(x1), Y(y1), X(x2) - X(x1), Y(y2) - Y(y1));
+    const id = String(p.id || "").split(":").pop();
+    const who = p.staff ? "Staf" : p.customer_id ? (p.name || "Pelanggan") + (p.mode === "MANUAL" ? " (manual)" : "") : "?";
+    label(X(x1), Y(y1), `${who} · ${id}`, col);
+  }
+  for (const f of o.faces || []) {
+    const [x1, y1, x2, y2] = f.box; ctx.strokeStyle = f.main ? "#22c55e" : "#9ca3af"; ctx.lineWidth = 3 * devicePixelRatio;
+    ctx.strokeRect(X(x1), Y(y1), X(x2) - X(x1), Y(y2) - Y(y1));
+  }
+  if (o.status !== undefined) {
+    ctx.fillStyle = "rgba(0,0,0,.7)"; ctx.fillRect(ox, oy, iw, 30 * devicePixelRatio);
+    ctx.fillStyle = "#fff"; ctx.font = `${Math.round(16 * devicePixelRatio)}px system-ui,Arial`;
+    ctx.fillText(o.status || "", ox + 10 * devicePixelRatio, oy + 21 * devicePixelRatio);
+  }
+  const now = performance.now(); shown.push(now); while (shown.length && now - shown[0] > 2000) shown.shift();
+  const rate = shown.length > 1 ? ((shown.length - 1) * 1000 / (now - shown[0])).toFixed(1) : "0";
+  ctx.font = `bold ${Math.round(18 * devicePixelRatio)}px Consolas,monospace`;
+  const info = `${title}  ·  ${rate} fps  ·  jam perangkat ${head ? clock(head.t) : "-"}`;
+  const bw = ctx.measureText(info).width + 16 * devicePixelRatio;
+  ctx.fillStyle = "rgba(0,0,0,.75)"; ctx.fillRect(ox, oy + ih - 30 * devicePixelRatio, bw, 30 * devicePixelRatio);
+  ctx.fillStyle = "#fff"; ctx.fillText(info, ox + 8 * devicePixelRatio, oy + ih - 9 * devicePixelRatio);
+}
+function message(text) {
+  status = text; if (lastImg) return;
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.fillStyle = "#fff"; ctx.font = `${Math.round(20 * devicePixelRatio)}px system-ui,Arial`; ctx.fillText(text, 20, 40 * devicePixelRatio);
+}
+function connect() {
+  if (!token) { message("Token tidak ada. Buka tautan ini dari CRM > Perangkat."); return; }
+  const ws = new WebSocket(`ws://${location.host}/live?cam=${encodeURIComponent(cam)}&token=${encodeURIComponent(token)}&fps=${fps}&w=${width}&q=${quality}`);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => message("Menunggu gambar...");
+  ws.onmessage = async (ev) => {
+    if (typeof ev.data === "string") return;
+    try {
+      const dv = new DataView(ev.data), n = dv.getUint32(0);
+      const head = JSON.parse(new TextDecoder().decode(new Uint8Array(ev.data, 4, n)));
+      const bmp = await createImageBitmap(new Blob([new Uint8Array(ev.data, 4 + n)], { type: "image/jpeg" }));
+      if (lastImg && lastImg.close) lastImg.close();
+      draw(bmp, head);
+    } catch (e) { /* skip a broken picture */ }
+    if (ws.readyState === 1) ws.send("a");          // shown: the device may send the next one
+  };
+  ws.onclose = () => { message("Terputus, menyambung lagi..."); setTimeout(connect, 1500); };
+  ws.onerror = () => ws.close();
+}
+connect();
+</script></body></html>
+"""
+
+
+# ── Test-day logs (data/decisions.csv, data/metrics.csv): evidence without writing by hand ──
+
+class CsvLog:
+    def __init__(self, path, header: list):
+        self.path, self.header, self.lock = str(path), header, threading.Lock()
+
+    def write(self, row: list):
+        try:
+            with self.lock:
+                new = not os.path.exists(self.path)
+                os.makedirs(os.path.dirname(self.path), exist_ok=True)
+                with open(self.path, "a", newline="", encoding="utf-8") as f:
+                    w = csv.writer(f)
+                    if new:
+                        w.writerow(self.header)
+                    w.writerow([datetime.now().astimezone().isoformat(timespec="milliseconds")] + row)
+        except Exception:
+            pass                                    # logging must never stop recognition
+
+
+def lan_ip() -> str:
+    """This board's address on the current Wi-Fi (asks the routing table, sends nothing)."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except OSError:
+        return ""
+
+
+def cpu_temp():
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp") as f:
+            return round(int(f.read()) / 1000, 1)
+    except Exception:
+        return ""
+
+
+DECISIONS = CsvLog(HERE / "data" / "decisions.csv",
+                   ["waktu", "hasil", "pelanggan", "nama", "skor", "margin", "suara", "frame", "keputusan_dini",
+                    "lama_sesi_s", "wajah_cx", "wajah_lebar"])
+METRICS = CsvLog(HERE / "data" / "metrics.csv", ["waktu", "fps", "deteksi_ms", "embedding_ms", "suhu_c", "penonton_live"])
 
 
 def parse_vec(v) -> np.ndarray:
@@ -1270,16 +1428,18 @@ class Database(threading.Thread):
     # jobs from the camera loop
     def _run_job(self, kind: str, kw: dict):
         if kind == "log":
-            self._q("""INSERT INTO recognition_logs (customer_id, similarity_score, model_used, camera_id, recognized)
-                       VALUES (%s, %s, %s, %s, %s)""",
+            # "at" = when the face was recognised, so a write delayed by a network outage keeps its time
+            self._q("""INSERT INTO recognition_logs (customer_id, similarity_score, model_used, camera_id, recognized,
+                                                     created_at)
+                       VALUES (%s, %s, %s, %s, %s, LEAST(COALESCE(%s::timestamptz, NOW()), NOW()))""",
                     (kw["customer_id"], round(float(kw["score"]), 6), MODEL_TAG, self.cfg.device_id,
-                     kw["customer_id"] is not None))
+                     kw["customer_id"] is not None, kw.get("at")))
         elif kind == "visit":
             cid = kw["customer_id"]
             if self.has_visit_fn:
                 try:
-                    self._q("SELECT get_or_create_visit(%s::uuid, %s, %s, NOW())",
-                            (cid, self.cfg.visit_max_open_hours, self.cfg.visit_reopen_min))
+                    self._q("SELECT get_or_create_visit(%s::uuid, %s, %s, LEAST(COALESCE(%s::timestamptz, NOW()), NOW()))",
+                            (cid, self.cfg.visit_max_open_hours, self.cfg.visit_reopen_min, kw.get("at")))
                     return
                 except Exception as e:
                     if "get_or_create_visit" not in str(e):
@@ -1361,6 +1521,15 @@ class Database(threading.Thread):
         src = ""
         if row and isinstance(row[0], dict):
             src = str(((row[0].get(self.cfg.device_id) or {}).get("face") or {}).get("source") or "")
+        vs = self._q("SELECT value FROM app_settings WHERE key = 'visits'", (), "one")
+        if vs and isinstance(vs[0], dict):                 # CRM -> Pengaturan -> Lantai & kunjungan
+            try:
+                if vs[0].get("reopen_minutes"):
+                    self.cfg.visit_reopen_min = int(vs[0]["reopen_minutes"])
+                if vs[0].get("max_open_hours"):
+                    self.cfg.visit_max_open_hours = int(vs[0]["max_open_hours"])
+            except (TypeError, ValueError):
+                pass
         st = self._q("SELECT value FROM app_settings WHERE key = 'stream'", (), "one")
         if self.engine.streamer is not None:
             self.engine.streamer.configure(st[0] if st and isinstance(st[0], dict) else None)
@@ -1566,6 +1735,7 @@ class Engine:
 
     def _end_enroll(self, ok: bool, message: str, embs=None):
         rid, cid = self.enroll_req
+        DECISIONS.write(["daftar_ok" if ok else "daftar_gagal", cid, "", "", "", "", len(embs or []), 0, "", "", message])
         self.enroll_req, self.enroll_sess = None, None
         with self.state.lock:
             self.state.enroll = None
@@ -1609,7 +1779,7 @@ class Engine:
         s.samples.append(Sample(q, e, face_geo(frame, face)))
         s.t_last = now
         if 0 < self.cfg.early_frames <= len(s.samples) < self.cfg.session_frames and self._strong(s):
-            self._close_session(now)
+            self._close_session(now, early=True)
             return
         if len(s.samples) >= self.cfg.session_frames or now - s.t0 >= self.cfg.session_max_sec:
             self._close_session(now)
@@ -1623,13 +1793,16 @@ class Engine:
         return (total >= 3 and agree == total and d.score >= self.cfg.match_threshold + 0.10
                 and d.margin >= 2 * self.cfg.match_margin)
 
-    def _close_session(self, now: float):
+    def _close_session(self, now: float, early: bool = False):
         s, self.sess = self.sess, Session()
         if len(s.samples) < self.cfg.session_min_frames or max(x.q for x in s.samples) < 0.30:
             return
         d = decide(self.cfg, self.gallery, s)
         self.state.last_decision = d
         name = self.gallery.name(d.customer_id)
+        geo = median_geo(s.samples) or {}
+        DECISIONS.write([d.state, d.customer_id or "", name, round(d.score, 4), round(d.margin, 4), d.votes, d.n,
+                         int(early), round(now - s.t0, 2), geo.get("cx", ""), geo.get("w", "")])
         if d.state == "known":
             self.flash(f"{name or d.customer_id[:8]} ({d.score:.2f})")
             log.info("[KNOWN] %s score=%.3f margin=%.3f votes=%s frames=%d", name, d.score, d.margin, d.votes, d.n)
@@ -1638,15 +1811,15 @@ class Engine:
             if now - self.last_known.get(d.customer_id, 0.0) >= self.cfg.known_log_cooldown:
                 self.last_known[d.customer_id] = now
                 if self.db:
-                    self.db.submit("log", customer_id=d.customer_id, score=d.score)
-                    self.db.submit("visit", customer_id=d.customer_id)
+                    self.db.submit("log", customer_id=d.customer_id, score=d.score, at=utc_iso(now))
+                    self.db.submit("visit", customer_id=d.customer_id, at=utc_iso(now))
         elif d.state == "unknown":
             self.flash("Belum terdaftar")
             if now - self.last_unknown >= self.cfg.unknown_log_cooldown:
                 self.last_unknown = now
                 log.info("[UNKNOWN] best=%.3f frames=%d", d.score, d.n)
                 if self.db:
-                    self.db.submit("log", customer_id=None, score=d.score)
+                    self.db.submit("log", customer_id=None, score=d.score, at=utc_iso(now))
         else:
             self.flash("Belum yakin, tahan sebentar")
             log.info("[UNCERTAIN] best=%.3f margin=%.3f votes=%s", d.score, d.margin, d.votes)
@@ -1784,9 +1957,11 @@ def main():
             return None
         with state.lock:
             view = dict(state.view)
+        view["cam"] = "face"
         return fr, fseq, view
     engine.live = LiveCast(live_source, port=cfg.live_port, fps=cfg.live_fps, max_width=cfg.live_width,
-                           tunnel=cfg.live_tunnel, public_url=cfg.live_public_url).start()
+                           tunnel=cfg.live_tunnel, public_url=cfg.live_public_url, bind=cfg.live_bind,
+                           lan_ip=lan_ip).start()
     camera.start()
     server = ThreadingHTTPServer((cfg.local_host, cfg.local_port), http_handler(state, engine, cfg))
     server.daemon_threads = True
@@ -1794,6 +1969,7 @@ def main():
     log.info("[HTTP] http://%s:%d/video_feed  /health", cfg.local_host, cfg.local_port)
 
     seq, n, t_fps, errors = 0, 0, time.time(), 0
+    t_metrics = time.time()
     try:
         while True:
             frame, new_seq = camera.latest(seq)
@@ -1812,6 +1988,10 @@ def main():
             n += 1
             if now - t_fps >= 2.0:
                 state.fps, n, t_fps = n / (now - t_fps), 0, now
+            if now - t_metrics >= 60:
+                t_metrics = now
+                METRICS.write([round(state.fps, 1), round(state.det_ms, 1), round(state.emb_ms, 1), cpu_temp(),
+                               engine.live.clients if getattr(engine, "live", None) else 0])
     except KeyboardInterrupt:
         log.info("stopped")
 
