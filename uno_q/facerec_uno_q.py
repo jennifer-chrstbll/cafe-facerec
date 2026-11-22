@@ -973,7 +973,8 @@ class Tunnel(threading.Thread):
         home = os.path.expanduser("~")
         for c in (self.binary, os.environ.get("CLOUDFLARED", ""), shutil.which("cloudflared") or "",
                   os.path.join(home, "cloudflared"), os.path.join(home, ".local", "bin", "cloudflared"),
-                  "/usr/local/bin/cloudflared", "/usr/bin/cloudflared"):
+                  "/usr/local/bin/cloudflared", "/usr/bin/cloudflared",
+                  r"C:\Program Files (x86)\cloudflared\cloudflared.exe", r"C:\Program Files\cloudflared\cloudflared.exe"):
             if c and os.path.isfile(c) and os.access(c, os.X_OK):
                 return c
         return None
@@ -1292,7 +1293,7 @@ class Tile {
       const [x1, y1, x2, y2] = p.box, col = p.staff ? "#f59e0b" : p.customer_id ? "#22c55e" : "#3b82f6";
       ctx.strokeStyle = col; ctx.lineWidth = lw * 1.5; ctx.strokeRect(X(x1), Y(y1), X(x2) - X(x1), Y(y2) - Y(y1));
       const id = String(p.id || "").split(":").pop();
-      const who = p.staff ? "Staf" : p.customer_id ? (p.name || "Pelanggan") + (p.mode === "MANUAL" ? " (manual)" : "") : "?";
+      const who = p.staff ? "Staf" : p.customer_id ? (p.name || "Pelanggan") + (p.unsure ? "?" : "") + (p.mode === "MANUAL" ? " (manual)" : "") : "?";
       this.label(X(x1), Y(y1), `${who} · ${id}`, col, u);
     }
     for (const f of o.faces || []) {
